@@ -1,0 +1,12 @@
+[project]
+name = "mark-tool"
+version = "0.1.0"
+description = "唛头生成桌面工具(南北 / 东西唛头 Excel)"
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "pyside6>=6.7",
+]
+
+[tool.uv]
+package = false

@@ -2,3 +2,8 @@
 .mimosa/
 .~*.xlsx
 ~$*.xlsx
+
+# uv / Python
+.venv/
+__pycache__/
+*.pyc
