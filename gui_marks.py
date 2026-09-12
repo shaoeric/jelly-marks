@@ -4,9 +4,15 @@
 唛头生成桌面工具(PySide6 GUI)
 ==============================
 
-一个 PySide6 界面小工具:菜单栏「唛头」→ 选择 Excel 文件,列出所有 sheet,
+一个 PySide6 桌面工具「小小工具」:主窗口左侧是功能栏,点选其中一项即
+在右侧区域显示对应功能页,不新开窗口,也不占用系统菜单栏。
+
+当前已装功能「小小唛头-wichita」:选择 Excel 文件,列出所有 sheet,
 指定其中一个为 packing list sheet、另一个为 gw sheet(两者不能相同),
 然后一键生成南北唛头 Excel 和东西唛头 Excel。
+
+增加新功能的方式:写一个功能页 Widget,在 MainWindow 里用 _add_feature
+注册即可(左侧栏与右侧页面会同时加好)。
 
 特点
 - 不修改现有生成脚本:运行时动态加载并调用
@@ -37,13 +43,16 @@ import sys
 import traceback
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QFont
+from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QVBoxLayout, QWidget,
+    QPushButton, QStackedWidget, QVBoxLayout, QWidget,
 )
 
+
+APP_NAME = "小小工具"
+MARKS_FEATURE_NAME = "小小唛头-wichita"
 
 NS_SCRIPT = "generate_marks_南北-0906.py"
 EW_SCRIPT = "generate_marks_东西-0906.py"
@@ -139,54 +148,35 @@ class GenerateWorker(QThread):
         self.finished_with.emit(results)
 
 
-class MarkWindow(QMainWindow):
-    """PySide6 UI: pick a workbook, pick two sheets, generate both marks."""
+class MarkPage(QWidget):
+    """唛头生成功能页: 选工作簿、指定两个 sheet、生成南北与东西唛头。"""
 
-    def __init__(self):
-        super().__init__()
+    status_changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.excel_path = None
         self.sheet_info = []          # [(sheet name, is_hidden), ...]
         self.ns_sheet = None
         self.gw_sheet = None
         self.worker = None
-
-        self.setWindowTitle("唛头生成工具")
-        self.resize(820, 620)
-        self.setMinimumSize(720, 540)
-        self._build_menu()
         self._build_ui()
-        self.statusBar().showMessage("就绪")
 
-    def _busy(self):
+    def is_busy(self):
         return self.worker is not None and self.worker.isRunning()
 
     # ------------------------------------------------------------------ UI
-    def _build_menu(self):
-        menu = self.menuBar().addMenu("唛头")
-        act_choose = QAction("选择 Excel 文件…", self)
-        act_choose.triggered.connect(self.choose_file)
-        menu.addAction(act_choose)
-        act_rechoose = QAction("重新选择文件", self)
-        act_rechoose.triggered.connect(self.choose_file)
-        menu.addAction(act_rechoose)
-        menu.addSeparator()
-        act_clear_ns = QAction("清除 Packing List 选择", self)
-        act_clear_ns.triggered.connect(lambda: self.clear_sheet("ns"))
-        menu.addAction(act_clear_ns)
-        act_clear_gw = QAction("清除 GW sheet 选择", self)
-        act_clear_gw.triggered.connect(lambda: self.clear_sheet("gw"))
-        menu.addAction(act_clear_gw)
-        menu.addSeparator()
-        act_quit = QAction("退出", self)
-        act_quit.triggered.connect(self.close)
-        menu.addAction(act_quit)
-
     def _build_ui(self):
-        central = QWidget(self)
-        self.setCentralWidget(central)
-        outer = QVBoxLayout(central)
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(10)
+
+        header = QLabel(MARKS_FEATURE_NAME, self)
+        header_font = QFont()
+        header_font.setPointSize(15)
+        header_font.setBold(True)
+        header.setFont(header_font)
+        outer.addWidget(header)
 
         # file row
         file_box = QGroupBox("Excel 文件", self)
@@ -282,10 +272,10 @@ class MarkWindow(QMainWindow):
         for widget in (self.btn_choose, self.btn_run, self.btn_set_ns,
                        self.btn_set_gw, self.btn_ns_clear, self.btn_gw_clear):
             widget.setEnabled(not busy)
-        self.statusBar().showMessage("生成中…" if busy else "就绪")
+        self.status_changed.emit("生成中…" if busy else "就绪")
 
     def choose_file(self):
-        if self._busy():
+        if self.is_busy():
             return
         path, _ = QFileDialog.getOpenFileName(
             self, "选择 Excel 文件", "",
@@ -350,7 +340,7 @@ class MarkWindow(QMainWindow):
             self.set_sheet("gw")
 
     def set_sheet(self, which):
-        if self._busy():
+        if self.is_busy():
             return
         if not self.excel_path:
             QMessageBox.warning(self, "提示", "请先选择 Excel 文件")
@@ -373,7 +363,7 @@ class MarkWindow(QMainWindow):
                   % ("Packing List sheet" if which == "ns" else "GW sheet", name))
 
     def clear_sheet(self, which):
-        if self._busy():
+        if self.is_busy():
             return
         if which == "ns":
             self.ns_sheet = None
@@ -384,7 +374,7 @@ class MarkWindow(QMainWindow):
                   % ("Packing List sheet" if which == "ns" else "GW sheet"))
 
     def on_generate(self):
-        if self._busy():
+        if self.is_busy():
             return
         if not self.excel_path:
             QMessageBox.warning(self, "提示", "请先选择 Excel 文件")
@@ -424,8 +414,127 @@ class MarkWindow(QMainWindow):
                             for r in results if not r["ok"])
             QMessageBox.critical(self, "生成失败", bad)
 
+class MainWindow(QMainWindow):
+    """主窗口「小小工具」。
+
+    功能都列在左侧栏,点选其中一项即在右侧区域显示对应功能页;
+    不使用系统菜单栏,也不新开窗口。
+    后续新增功能: 写一个功能页 Widget,在 __init__ 里用 _add_feature 注册即可。
+    若功能页提供 is_busy(),状态栏会在它忙碌时自动显示"生成中…"。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.resize(900, 700)
+        self.setMinimumSize(780, 560)
+
+        self.mark_page = MarkPage(self)
+        self.mark_page.status_changed.connect(self._on_status)
+
+        self.stack = QStackedWidget(self)
+        self.nav = QListWidget(self)
+
+        self._build_ui()
+        self._add_feature("首页", self._build_home())
+        self._add_feature(MARKS_FEATURE_NAME, self.mark_page)
+        self.nav.setCurrentRow(0)
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        row = QHBoxLayout(central)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addWidget(self._build_sidebar())
+        row.addWidget(self.stack, 1)
+
+    def _build_sidebar(self):
+        """左侧栏: 顶部工具名,中间功能列表,底部退出按钮。"""
+        side = QWidget(self)
+        side.setObjectName("sidebar")
+        side.setFixedWidth(200)
+        side.setStyleSheet("#sidebar { background: #f4f4f6;"
+                           " border-right: 1px solid #dcdce0; }")
+
+        layout = QVBoxLayout(side)
+        layout.setContentsMargins(14, 16, 14, 14)
+        layout.setSpacing(12)
+
+        title = QLabel(APP_NAME, side)
+        title_font = QFont()
+        title_font.setPointSize(17)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        self.nav.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.nav.setStyleSheet(
+            "QListWidget { background: transparent; border: none;"
+            " outline: none; }"
+            "QListWidget::item { padding: 7px 10px; }"
+            "QListWidget::item:hover { background: #e7e7ec; }"
+            "QListWidget::item:selected { background: #d7e5f7;"
+            " color: #12395f; }")
+        self.nav.currentRowChanged.connect(self._on_nav_changed)
+        layout.addWidget(self.nav, 1)
+
+        btn_quit = QPushButton("退出", side)
+        btn_quit.clicked.connect(self.close)
+        layout.addWidget(btn_quit)
+        return side
+
+    def _build_home(self):
+        """首页: 只做导航提示,功能要点了左侧栏才进入。"""
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.addStretch(1)
+
+        title = QLabel(APP_NAME, page)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_font = QFont()
+        title_font.setPointSize(30)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        hint = QLabel("请从左侧选择要使用的功能", page)
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setStyleSheet("color: #666666;")
+        layout.addWidget(hint)
+
+        layout.addSpacing(20)
+        features = QLabel("已安装功能: %s(生成南北 / 东西唛头)"
+                          % MARKS_FEATURE_NAME, page)
+        features.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        features.setStyleSheet("color: #888888;")
+        layout.addWidget(features)
+
+        layout.addStretch(1)
+        return page
+
+    def _add_feature(self, name, page):
+        """注册一个功能: 左侧栏加一项、右侧容器加一页,两者索引保持一致。"""
+        item = QListWidgetItem(name)
+        item.setData(Qt.ItemDataRole.UserRole, page)
+        self.nav.addItem(item)
+        self.stack.addWidget(page)
+
+    # ------------------------------------------------------------- actions
+    def _on_nav_changed(self, row):
+        if row < 0:
+            return
+        page = self.nav.item(row).data(Qt.ItemDataRole.UserRole)
+        self.stack.setCurrentWidget(page)
+        busy = hasattr(page, "is_busy") and page.is_busy()
+        self._on_status("生成中…" if busy else "就绪")
+
+    def _on_status(self, text):
+        self.statusBar().showMessage(text)
+
     def closeEvent(self, event):
-        if self._busy():
+        if self.mark_page.is_busy():
             QMessageBox.warning(self, "提示", "正在生成,请等待完成后再关闭")
             event.ignore()
             return
@@ -458,8 +567,8 @@ def main():
         sys.exit(run_selftest(args.selftest, args.sheet, args.gw_sheet))
 
     app = QApplication(sys.argv)
-    app.setApplicationName("唛头生成工具")
-    window = MarkWindow()
+    app.setApplicationName(APP_NAME)
+    window = MainWindow()
     window.show()
     window.raise_()
     window.activateWindow()
