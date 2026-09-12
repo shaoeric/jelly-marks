@@ -6,18 +6,24 @@ CI 里由 .github/workflows/release-windows.yml 调用;本地手动执行:
     GH_TOKEN=xxx GITHUB_REPOSITORY=owner/repo TAG=v0.1.0 \
         uv run python scripts/publish_release.py
 
-为什么不用 gh CLI,而是直接调 GitHub REST API:
-资源名叫「小小工具.exe」,是非 ASCII。用 gh 时这个名字会丢,服务端退化成
-default.exe(v0.1.0 那两次都是这样)。注意 gh 手册里 `路径#文字` 设置的其实是
-display label(显示标签),并不是资源名,所以它管不到这件事。
-REST API 的上传接口把资源名放在 `?name=` 查询参数里(URL 编码的 UTF-8),
-这是文档规定的机制,不依赖命令行工具怎么传 argv,也不依赖 HTTP 头能否承载
-非 ASCII。
+为什么 exe 文件名用 ASCII、而不用中文:
+GitHub 的 Release 上传接口会重命名文件名——官方文档原话是 "GitHub renames asset
+filenames that have special characters, non-alphanumeric characters, and leading
+or trailing periods"。「小小工具」是非字母数字字符,被剥离后主干清空,GitHub 就
+填成了 default,于是资源变成 default.exe(gh 和本脚本两条独立路径都得到同样结果,
+确认是服务端的既定行为,不是工具链问题)。
+中文改由资源 label 呈现:label 在发布页会替代文件名显示,由 ASSET_LABEL 传入。
+所以 exe 名必须是 ASCII(见 mark-tool.spec 的 EXE_NAME)。
+
+为什么这里直接调 REST API 而不是 gh CLI:
+原先用 gh 时也需要靠这个接口的 ?name= 参数指定资源名(gh 手册里的 `路径#文字`
+设置的是 display label,不是资源名)。直接用 urllib 可以少一层依赖,也便于把
+地址白名单、重试与回查都写在一起。
 
 遇到 422 already_exists 的处理:
-实测 Release 上只列出一个 default.exe,但 GitHub 认为「小小工具.exe」这个名字
-已被占用——资源名的唯一性记录和列表里显示的名字对不上。按显示名去找同名资源
-是找不到的,所以这种情况直接清掉 Release 上所有 exe 资源再重试一次。
+实测 Release 上只列出一个 default.exe,但目标名字却被认为已占用——资源名的唯一性
+记录与列表显示的名字对不上,按显示名去找同名资源找不到冲突源,所以这种情况直接
+清掉 Release 上所有 exe 资源再重试一次。
 
 上传完成后会回查资源名:名字不对就让任务失败,并且不删任何东西——
 那样用户至少还能把文件下载下来改名,比 Release 上一个 exe 都不剩要好。
@@ -96,8 +102,13 @@ def repository():
     return "%s/%s" % (owner, name)
 
 
-def request(method, url, data=None, content_type=None, want_json=True):
-    """发一个带鉴权的请求;404 返回 None,交给调用方判断。"""
+def request(method, url, data=None, content_type=None, want_json=True,
+            fatal=True):
+    """发一个带鉴权的请求。
+
+    404 返回 None,交给调用方判断。fatal=False 时其余错误只打印告警并返回
+    None,用于 label 这类"失败也不该影响发布"的附加操作。
+    """
     check_url(url)
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", "Bearer %s" % token())
@@ -120,8 +131,12 @@ def request(method, url, data=None, content_type=None, want_json=True):
         location = exc.headers.get("Location") if exc.headers else None
         if location:
             detail += "\n(服务端要求跳转到 %s,已被拒绝)" % location
-        raise SystemExit("::error::%s %s 失败: HTTP %d\n%s"
-                         % (method, url, exc.code, detail))
+        message = "::error::%s %s 失败: HTTP %d\n%s" % (
+            method, url, exc.code, detail)
+        if not fatal:
+            print("警告:" + message.replace("::error::", ""))
+            return None
+        raise SystemExit(message)
     return json.loads(body) if want_json else body
 
 
@@ -180,6 +195,20 @@ def drop_exe_assets(repo, release_id, keep_id=None):
             delete_asset(repo, asset["id"])
 
 
+def set_asset_label(repo, asset_id, label):
+    """给资源设一个展示用 label(发布页用它替代文件名显示)。
+
+    best-effort:失败只告警,不影响发布本身。
+    """
+    url = "%s/repos/%s/releases/assets/%d" % (API, repo, asset_id)
+    payload = json.dumps({"label": label}).encode("utf-8")
+    result = request("PATCH", url, data=payload,
+                     content_type="application/json", fatal=False)
+    if result is not None:
+        print("已设置展示标签: %r" % result.get("label"))
+    return result
+
+
 def upload_resolving_conflict(repo, release_id, exe, name):
     """上传;若名字已被占用则清掉现有 exe 资源后重试一次。"""
     try:
@@ -214,6 +243,11 @@ def publish(repo, tag, exe, prerelease=False):
     uploaded = upload_resolving_conflict(repo, release_id, exe, name)
     print("上传完成: %r (asset id=%s)" % (uploaded["name"], uploaded["id"]))
 
+    # 发布页用它替代文件名显示,这样文件名是 ASCII、界面上仍是中文
+    label = os.environ.get("ASSET_LABEL", "").strip()
+    if label:
+        set_asset_label(repo, uploaded["id"], label)
+
     # 先确认期望的资源名真的在 Release 上,再清理历史错名资源。
     # 顺序很关键:万一名字又被改写,这里必须先失败退出,不能顺手把刚上传的
     # 那个 exe 也删掉——那样 Release 上一个 exe 都不剩,比留着一个名字错、
@@ -221,9 +255,11 @@ def publish(repo, tag, exe, prerelease=False):
     assets = list_assets(repo, release_id)
     names = [a["name"] for a in assets]
     if name not in names:
-        raise SystemExit("::error::资源名应为 %r,实际为 %s。"
-                         "未删除任何资源,可先手动下载确认内容是否正常。"
-                         % (name, names))
+        raise SystemExit(
+            "::error::资源名应为 %r,实际为 %s。GitHub 会重命名含非字母数字字符的"
+            "资源名(中文会被剥离,主干清空后退化成 default),所以 exe 文件名必须"
+            "是 ASCII——请检查 mark-tool.spec 里的 EXE_NAME。"
+            "未删除任何资源,可先手动下载确认内容是否正常。" % (name, names))
 
     for asset in assets:
         other = asset["name"]

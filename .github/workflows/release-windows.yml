@@ -122,6 +122,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.version }}
           PRERELEASE: ${{ inputs.prerelease }}
-        # 具体逻辑在 scripts/publish_release.py 里(见该文件顶部说明:
-        # 为什么必须在 Windows 上由 Python 而不是 bash 去调用 gh)
+          # exe 文件名必须是 ASCII(GitHub 会剥离非字母数字字符),
+          # 中文名字靠资源的 label 在发布页上展示
+          ASSET_LABEL: 小小工具
+        # 具体逻辑在 scripts/publish_release.py 里(见该文件顶部说明)
         run: uv run python scripts/publish_release.py

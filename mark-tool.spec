@@ -20,7 +20,11 @@
 
 import os
 
-EXE_NAME = "小小工具"
+# exe 文件名必须用 ASCII。GitHub 的 Release 上传接口会重命名含非字母数字字符的
+# 文件名("GitHub renames asset filenames that have special characters,
+# non-alphanumeric characters, and leading or trailing periods"),中文会被剥掉、
+# 主干清空后退化成 default.exe。中文名改由发布后在 Release 上打 label 展示。
+EXE_NAME = "XiaoXiaoTool"
 ENTRY_SCRIPT = "gui_marks.py"
 
 # 这两个生成脚本没有在 gui_marks.py 里 import,而是运行时按文件名动态加载
