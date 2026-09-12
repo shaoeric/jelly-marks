@@ -120,16 +120,8 @@ jobs:
       - name: 发布 Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="${{ inputs.version }}"
-          PRE=""
-          if [ "${{ inputs.prerelease }}" = "true" ]; then
-            PRE="--prerelease"
-          fi
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG 已存在,覆盖其中的 exe"
-            gh release upload "$TAG" dist/*.exe --clobber
-          else
-            gh release create "$TAG" dist/*.exe \
-              --title "$TAG" --generate-notes $PRE
-          fi
+          TAG: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        # 具体逻辑在 scripts/publish_release.py 里(见该文件顶部说明:
+        # 为什么必须在 Windows 上由 Python 而不是 bash 去调用 gh)
+        run: uv run python scripts/publish_release.py
