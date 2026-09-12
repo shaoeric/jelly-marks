@@ -23,6 +23,10 @@ jobs:
     defaults:
       run:
         shell: bash     # 统一用 bash,glob 和路径处理比 PowerShell 更可预期
+    env:
+      # Windows runner 的区域设置是英文,stdout 被重定向时 Python 默认按 cp1252
+      # 编码,脚本里打印中文会抛 UnicodeEncodeError。整个 job 统一成 UTF-8。
+      PYTHONIOENCODING: utf-8
 
     steps:
       - uses: actions/checkout@v7
