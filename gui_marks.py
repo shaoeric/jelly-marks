@@ -32,6 +32,14 @@
                                             # 不开界面,直接跑两个生成器(自检)
 macOS 也可以直接双击同目录的 "启动界面.command"。
 
+编码与路径:
+- 源码为 UTF-8;窗口内的标题、label 等文字由 Qt 以 Unicode 渲染,与系统区域无关,
+  Windows 上不会出现乱码;
+- 控制台输出在入口统一重设为 UTF-8(见 configure_stdio),避免 Windows 重定向
+  输出时中文触发 UnicodeEncodeError;
+- 路径一律走 os.path 处理(不硬编码分隔符),生成脚本也接受两种斜杠混用,
+  并对 Windows 的 260 字符路径上限做了提前检查。
+
 依赖: 见 pyproject.toml (PySide6 + openpyxl),执行 uv sync 安装。
 """
 
@@ -43,7 +51,7 @@ import sys
 import traceback
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QBrush, QColor, QFont
+from PySide6.QtGui import QBrush, QColor, QFont, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
@@ -58,6 +66,46 @@ NS_SCRIPT = "generate_marks_南北-0906.py"
 EW_SCRIPT = "generate_marks_东西-0906.py"
 NS_SUFFIX = "南北唛头"
 EW_SUFFIX = "东西唛头"
+
+
+def configure_stdio():
+    """把控制台输出统一成 UTF-8。
+
+    窗口里的文字走 Qt,内部本来就是 Unicode,不存在编码问题;这里只针对
+    控制台输出(--selftest 的 print)。Windows 上如果 stdout 被重定向、而系统
+    区域又不是中文,默认编码可能编不出中文并抛 UnicodeEncodeError,所以显式
+    指定 UTF-8,并把 errors 放宽成 replace 作为兜底。
+    打包成 windowed exe 时 sys.stdout / sys.stderr 为 None,直接跳过。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def output_names_for(excel_path):
+    """两个输出文件名(南北 / 东西),都是纯文件名,写到所选 Excel 所在目录。"""
+    stem = os.path.splitext(os.path.basename(excel_path))[0]
+    return ["%s-%s.xlsx" % (stem, NS_SUFFIX), "%s-%s.xlsx" % (stem, EW_SUFFIX)]
+
+
+def windows_path_limit_hit(folder, names):
+    """Windows 上整条路径超过 260 字符就保存不了,提前查出超长的那一条。
+
+    非 Windows 平台一律返回 None。放长路径支持(注册表 LongPathsEnabled)之外,
+    这是 Windows 特有的失败点,提前提示比让 openpyxl 抛一个含糊的错更好。
+    """
+    if os.name != "nt":
+        return None
+    for name in names:
+        full = os.path.abspath(os.path.join(folder or ".", name))
+        if len(full) > 255:
+            return full
+    return None
 
 
 def app_dir():
@@ -107,12 +155,11 @@ def run_generator(filename, module_name, excel_path, sheet, gw_sheet, out_name):
 
 def run_both(excel_path, sheet, gw_sheet, log=None):
     """Generate the N/S and E/W mark workbooks; returns list of results."""
-    stem = os.path.splitext(os.path.basename(excel_path))[0]
+    out_ns, out_ew = output_names_for(excel_path)
     results = []
-    for label, script, module_name, suffix in (
-            ("南北", NS_SCRIPT, "marks_ns", NS_SUFFIX),
-            ("东西", EW_SCRIPT, "marks_ew", EW_SUFFIX)):
-        out_name = "%s-%s.xlsx" % (stem, suffix)
+    for label, script, module_name, out_name in (
+            ("南北", NS_SCRIPT, "marks_ns", out_ns),
+            ("东西", EW_SCRIPT, "marks_ew", out_ew)):
         if log:
             log("开始生成%s唛头 -> %s ..." % (label, out_name))
         ok, message = run_generator(script, module_name, excel_path,
@@ -254,7 +301,12 @@ class MarkPage(QWidget):
 
         self.log_text = QPlainTextEdit(self)
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Menlo", 12))
+        # 用各平台自己的等宽字体(Windows 上是 Consolas、macOS 上是 Menlo),
+        # 而不是写死某个平台的字体名;缺字形时 Qt 会做字体回退,中文可正常显示。
+        log_font = QFontDatabase.systemFont(
+            QFontDatabase.SystemFont.FixedFont)
+        log_font.setPointSize(12)
+        self.log_text.setFont(log_font)
         self.log_text.setMinimumHeight(160)
         outer.addWidget(self.log_text, 1)
 
@@ -386,6 +438,16 @@ class MarkPage(QWidget):
         if self.ns_sheet == self.gw_sheet:
             QMessageBox.warning(self, "提示",
                                 "Packing List sheet 与 GW sheet 不能相同")
+            return
+        too_long = windows_path_limit_hit(
+            os.path.dirname(self.excel_path),
+            output_names_for(self.excel_path))
+        if too_long:
+            QMessageBox.warning(
+                self, "路径过长",
+                "Windows 下完整路径超过 260 个字符就无法保存文件:\n\n%s\n\n"
+                "当前 %d 个字符。请把 Excel 文件移到层级更浅的目录后重试。"
+                % (too_long, len(too_long)))
             return
         self._set_busy(True)
         self._log("=" * 60)
@@ -554,6 +616,9 @@ def run_selftest(excel_path, sheet, gw_sheet):
 
 
 def main():
+    # 先把控制台输出固定成 UTF-8,Windows 上重定向输出时才不会因中文编码失败
+    configure_stdio()
+
     parser = argparse.ArgumentParser(description="唛头生成桌面工具")
     parser.add_argument("--selftest", metavar="EXCEL",
                         help="不开界面,直接跑两个生成器(自检)")
