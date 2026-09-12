@@ -1,0 +1,131 @@
+name: 打包 Windows exe 并发布 Release
+
+# 手动点击触发:仓库页面 Actions → 左侧选本工作流 → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号(同时作为 git tag 和 Release 名称,例如 v0.1.0)"
+        required: true
+        default: "v0.1.0"
+      prerelease:
+        description: "标记为预发布(Pre-release)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write        # 创建 / 更新 Release 需要写权限
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash     # 统一用 bash,glob 和路径处理比 PowerShell 更可预期
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 uv
+        # setup-uv 从 v8 起不再发布滚动主版本标签,官方建议固定到精确版本
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: 安装 Python 3.12
+        run: uv python install 3.12
+
+      - name: 按 uv.lock 安装依赖
+        run: uv sync --frozen
+
+      - name: 打包 exe
+        run: uv run pyinstaller --clean --noconfirm mark-tool.spec
+
+      - name: 查看产物体积
+        run: ls -lh dist/
+
+      - name: 校验多余文件确实被剔除
+        run: |
+          uv run python - <<'PY'
+          import glob
+          from PyInstaller.archive.readers import CArchiveReader
+
+          exe = glob.glob("dist/*.exe")[0]
+          names = [n.replace("\\", "/").lower() for n in CArchiveReader(exe).toc]
+          print("产物 %s,包内共 %d 项" % (exe, len(names)))
+
+          # mark-tool.spec 的 DROP_BASENAMES 应该已经把它们剔掉。这些是
+          # PyInstaller 的 Qt hook 在 Windows 上会无条件附带的"动态 OpenGL"
+          # 运行库,合计约 25MB,本工具走光栅绘制,用不到。
+          # 注意:纯 Python 模块(openpyxl 等)被压在包内的 PYZ.pyz 里,不在
+          # 这份列表内,它们能否正常工作由上面的冒烟测试实际验证。
+          for bad in ("opengl32sw.dll", "libegl.dll", "libglesv2.dll",
+                      "d3dcompiler_"):
+              hits = [n for n in names if bad in n]
+              if hits:
+                  raise SystemExit("::error::多余文件仍被打进包: %s" % hits)
+
+          # 生成脚本是运行时按文件名动态加载的数据文件,漏了 exe 就跑不起来
+          for need in ("generate_marks_南北-0906.py",
+                       "generate_marks_东西-0906.py"):
+              if not any(need in n for n in names):
+                  raise SystemExit("::error::包内缺少生成脚本: %s" % need)
+
+          print("校验通过:无用的 OpenGL 运行库已剔除,生成脚本已带上")
+          PY
+
+      - name: 冒烟测试(用打包好的 exe 真跑一次生成)
+        run: |
+          set -u
+          EXE=$(ls dist/*.exe | head -1)
+          echo "待测产物: $EXE"
+
+          IN="Shipping details for Wichita BLOCK  1-4(3).xlsx"
+          OUT_NS="${IN%.xlsx}-南北唛头.xlsx"
+          OUT_EW="${IN%.xlsx}-东西唛头.xlsx"
+          rm -f "$OUT_NS" "$OUT_EW"
+
+          # windowed 程序在 Windows 上不一定阻塞调用方,所以不看退出码,
+          # 改成轮询它有没有真的产出两个唛头文件。
+          # 这一测同时覆盖了: 内置生成脚本能否被动态加载、openpyxl 能否读表写表。
+          "$EXE" --selftest "$IN" \
+            --sheet "Block 5-8 Packing List" --gw-sheet "Batch_01_GW" || true
+
+          for _ in $(seq 1 60); do
+            [ -f "$OUT_NS" ] && [ -f "$OUT_EW" ] && break
+            sleep 2
+          done
+
+          if [ -f "$OUT_NS" ] && [ -f "$OUT_EW" ]; then
+            echo "冒烟测试通过: exe 能加载内置生成脚本并写出唛头"
+          else
+            echo "::error::冒烟测试失败,exe 没有产出唛头文件"
+            exit 1
+          fi
+          rm -f "$OUT_NS" "$OUT_EW"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-exe
+          path: dist/*.exe
+          if-no-files-found: error
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.version }}"
+          PRE=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            PRE="--prerelease"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在,覆盖其中的 exe"
+            gh release upload "$TAG" dist/*.exe --clobber
+          else
+            gh release create "$TAG" dist/*.exe \
+              --title "$TAG" --generate-notes $PRE
+          fi

@@ -5,7 +5,15 @@ description = "唛头生成桌面工具(南北 / 东西唛头 Excel)"
 requires-python = ">=3.12"
 dependencies = [
     "openpyxl>=3.1.5",
-    "pyside6>=6.7",
+    # 界面只用 QtCore / QtGui / QtWidgets,装 essentials 就够;
+    # 完整的 pyside6 会额外拉入 300MB+ 的 addons(WebEngine / 3D / Charts 等),
+    # 运行时和打包都用不到,所以这里直接依赖精简版。
+    "pyside6-essentials>=6.7",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.10",
 ]
 
 [tool.uv]

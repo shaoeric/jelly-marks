@@ -7,3 +7,7 @@
 .venv/
 __pycache__/
 *.pyc
+
+# PyInstaller 产物
+build/
+dist/
