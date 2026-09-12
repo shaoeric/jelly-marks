@@ -14,13 +14,20 @@ REST API 的上传接口把资源名放在 `?name=` 查询参数里(URL 编码�
 这是文档规定的机制,不依赖命令行工具怎么传 argv,也不依赖 HTTP 头能否承载
 非 ASCII。
 
+遇到 422 already_exists 的处理:
+实测 Release 上只列出一个 default.exe,但 GitHub 认为「小小工具.exe」这个名字
+已被占用——资源名的唯一性记录和列表里显示的名字对不上。按显示名去找同名资源
+是找不到的,所以这种情况直接清掉 Release 上所有 exe 资源再重试一次。
+
 上传完成后会回查资源名:名字不对就让任务失败,并且不删任何东西——
 那样用户至少还能把文件下载下来改名,比 Release 上一个 exe 都不剩要好。
 """
 
 import glob
+import ipaddress
 import json
 import os
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,6 +40,10 @@ TIMEOUT = 180
 ALLOWED_HOSTS = frozenset({"api.github.com", "uploads.github.com"})
 
 
+class AssetConflict(Exception):
+    """目标资源名已被占用(HTTP 422 already_exists)。"""
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """这几个接口不需要跳转;一律不跟随,避免被重定向到非白名单主机。"""
 
@@ -43,11 +54,30 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
+def check_host_is_public(host):
+    """解析主机名,拒绝本机 / 环回 / 私有 / 链路本地 / 保留 / 组播地址。"""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise SystemExit("::error::无法解析主机 %s: %s" % (host, exc))
+    for info in infos:
+        addr = ipaddress.ip_address(info[4][0])
+        if (addr.is_loopback or addr.is_private or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast
+                or addr.is_unspecified):
+            raise SystemExit("::error::拒绝访问非公网地址: %s (%s)"
+                             % (host, addr))
+
+
 def check_url(url):
-    """校验目标地址:必须 https 且在白名单域名内。"""
+    """发请求前的地址校验:必须 https、域名在白名单内、且解析到公网地址。"""
     parts = urllib.parse.urlsplit(url)
-    if parts.scheme != "https" or parts.hostname not in ALLOWED_HOSTS:
+    if parts.scheme != "https":
+        raise SystemExit("::error::只允许 https 请求: %s" % url)
+    host = parts.hostname or ""
+    if host not in ALLOWED_HOSTS:
         raise SystemExit("::error::拒绝请求白名单之外的地址: %s" % url)
+    check_host_is_public(host)
 
 
 def token():
@@ -82,6 +112,9 @@ def request(method, url, data=None, content_type=None, want_json=True):
         if exc.code == 404:
             return None
         detail = exc.read().decode("utf-8", "replace")
+        # 资源名冲突单独抛出,交给上层做清理重试
+        if exc.code == 422 and "already_exists" in detail:
+            raise AssetConflict(detail)
         # 上面禁用了跳转。万一 GitHub 真返回跳转,把目标地址打出来,
         # 免得只看到一个光秃秃的状态码
         location = exc.headers.get("Location") if exc.headers else None
@@ -116,7 +149,9 @@ def create_release(repo, tag, prerelease):
 
 
 def list_assets(repo, release_id):
-    url = "%s/repos/%s/releases/%d/assets" % (API, repo, release_id)
+    """列出 Release 上的全部资源(显式分页,避免默认只看最近一批)。"""
+    url = "%s/repos/%s/releases/%d/assets?per_page=100" % (
+        API, repo, release_id)
     return request("GET", url) or []
 
 
@@ -135,6 +170,28 @@ def upload_asset(repo, release_id, path, name):
                    content_type="application/octet-stream")
 
 
+def drop_exe_assets(repo, release_id, keep_id=None):
+    """删掉 Release 上现有的 exe 资源(只可能是本工具历史上传的)。"""
+    for asset in list_assets(repo, release_id):
+        if asset["id"] == keep_id:
+            continue
+        if asset["name"].lower().endswith(".exe"):
+            print("  删除资源: %r (id=%s)" % (asset["name"], asset["id"]))
+            delete_asset(repo, asset["id"])
+
+
+def upload_resolving_conflict(repo, release_id, exe, name):
+    """上传;若名字已被占用则清掉现有 exe 资源后重试一次。"""
+    try:
+        return upload_asset(repo, release_id, exe, name)
+    except AssetConflict:
+        # 名字的唯一性记录可能和列表里显示的名字对不上,光按同名去找是找不到的,
+        # 所以这里直接清掉所有 exe 资源再来一次。
+        print("资源名 %r 被占用,清理 Release 上的 exe 资源后重试" % name)
+        drop_exe_assets(repo, release_id)
+        return upload_asset(repo, release_id, exe, name)
+
+
 def publish(repo, tag, exe, prerelease=False):
     """创建或更新 Release 并上传 exe;返回最终资源名列表。"""
     name = os.path.basename(exe)
@@ -145,13 +202,16 @@ def publish(repo, tag, exe, prerelease=False):
         release = create_release(repo, tag, prerelease)
     release_id = release["id"]
 
+    existing = list_assets(repo, release_id)
+    print("Release 现有资源: %s" % [a["name"] for a in existing])
+
     # 先删掉同名旧资源,等价于 gh 的 --clobber
-    for asset in release.get("assets", []):
+    for asset in existing:
         if asset["name"] == name:
             print("删除同名旧资源: %r" % asset["name"])
             delete_asset(repo, asset["id"])
 
-    uploaded = upload_asset(repo, release_id, exe, name)
+    uploaded = upload_resolving_conflict(repo, release_id, exe, name)
     print("上传完成: %r (asset id=%s)" % (uploaded["name"], uploaded["id"]))
 
     # 先确认期望的资源名真的在 Release 上,再清理历史错名资源。
