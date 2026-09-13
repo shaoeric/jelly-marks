@@ -86,29 +86,75 @@ jobs:
           EXE=$(ls dist/*.exe | head -1)
           echo "待测产物: $EXE"
 
-          IN="Shipping details for Wichita BLOCK  1-4(3).xlsx"
-          OUT_NS="${IN%.xlsx}-南北唛头.xlsx"
-          OUT_EW="${IN%.xlsx}-东西唛头.xlsx"
-          rm -f "$OUT_NS" "$OUT_EW"
+          # 当前测例在 cases/wichita-唛头/ 下,先确认文件还在:windowed 的 exe 没有
+          # 控制台,测例缺失时只会表现成"等不到输出文件",看不出原因。
+          CASES="cases/wichita-唛头"
+          NS_IN="$CASES/input-Shipping details for Wichita.xlsx"
+          EW_IN="$CASES/副本input-Shipping details for Wichita.xlsx"
+          for f in "$NS_IN" "$EW_IN"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::冒烟测试用的测例文件不存在: $f"
+              echo "目录 $CASES 现有内容:"
+              ls -1 "$CASES" 2>/dev/null || echo "(目录不存在)"
+              exit 1
+            fi
+          done
 
-          # windowed 程序在 Windows 上不一定阻塞调用方,所以不看退出码,
-          # 改成轮询它有没有真的产出两个唛头文件。
-          # 这一测同时覆盖了: 内置生成脚本能否被动态加载、openpyxl 能否读表写表。
-          "$EXE" --selftest "$IN" \
-            --sheet "Block 5-8 Packing List" --gw-sheet "Batch_01_GW" || true
+          # 复制成短名字再跑,避免中文长文件名在 Windows 上撞 260 字符上限
+          WORK="smoke-work"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          cp "$NS_IN" "$WORK/ns.xlsx"
+          cp "$EW_IN" "$WORK/ew.xlsx"
 
+          # 案例1: 1号 sheet 只有南北方向的货(EW1..EW7 全空),东西方向预期报错;
+          #        顺便验证"生成失败不留文件"——失败的那一路不应该写出东西唛头。
+          NS_OUT="$WORK/ns-1号-南北唛头.xlsx"
+          NS_OUT_EW="$WORK/ns-1号-东西唛头.xlsx"
+          rm -f "$NS_OUT" "$NS_OUT_EW"
+          "$EXE" --selftest "$WORK/ns.xlsx" --sheet "1号" \
+            --gw-sheet "Batch_01_GW" || true
           for _ in $(seq 1 60); do
-            [ -f "$OUT_NS" ] && [ -f "$OUT_EW" ] && break
+            [ -f "$NS_OUT" ] && break
             sleep 2
           done
 
-          if [ -f "$OUT_NS" ] && [ -f "$OUT_EW" ]; then
-            echo "冒烟测试通过: exe 能加载内置生成脚本并写出唛头"
-          else
-            echo "::error::冒烟测试失败,exe 没有产出唛头文件"
+          # 案例2: 2号 sheet 南北/东西都有货,覆盖东西方向的生成脚本。
+          EW_OUT="$WORK/ew-2号-南北唛头.xlsx"
+          EW_OUT_EW="$WORK/ew-2号-东西唛头.xlsx"
+          rm -f "$EW_OUT" "$EW_OUT_EW"
+          "$EXE" --selftest "$WORK/ew.xlsx" --sheet "2号" \
+            --gw-sheet "Batch_01_GW" || true
+          for _ in $(seq 1 60); do
+            [ -f "$EW_OUT" ] && [ -f "$EW_OUT_EW" ] && break
+            sleep 2
+          done
+
+          fail=0
+          [ -f "$NS_OUT" ]      || { echo "::error::1号 sheet 没有产出南北唛头"; fail=1; }
+          [ ! -f "$NS_OUT_EW" ] || { echo "::error::1号 sheet 没有 EW 数据,却产出了东西唛头(失败时不该创建文件)"; fail=1; }
+          [ -f "$EW_OUT" ]      || { echo "::error::2号 sheet 没有产出南北唛头"; fail=1; }
+          [ -f "$EW_OUT_EW" ]   || { echo "::error::2号 sheet 没有产出东西唛头"; fail=1; }
+          if ls "$WORK"/*.part.xlsx >/dev/null 2>&1; then
+            echo "::error::残留了未清理的临时文件: $(ls "$WORK"/*.part.xlsx)"
+            fail=1
+          fi
+          if [ "$fail" != "0" ]; then
+            # exe 是 windowed 构建,没有控制台,生成脚本打印的报错看不到。用同一份
+            # 代码(未打包)重跑一遍,真实原因就会直接打在上面的 CI 日志里。
+            echo "::group::诊断: 用未打包的脚本重跑同样的自检"
+            for case in "ns.xlsx:1号" "ew.xlsx:2号"; do
+              file="${case%%:*}"; sheet="${case##*:}"
+              echo "----- $file / $sheet -----"
+              uv run python gui_marks.py --selftest "$WORK/$file" \
+                --sheet "$sheet" --gw-sheet "Batch_01_GW" || true
+            done
+            echo "::endgroup::"
+            echo "----- 工作目录 -----"; ls -la "$WORK" 2>/dev/null || true
+            rm -rf "$WORK"
             exit 1
           fi
-          rm -f "$OUT_NS" "$OUT_EW"
+          echo "冒烟测试通过: exe 能加载内置的两个生成脚本并写出唛头,失败的那一路未留文件"
+          rm -rf "$WORK"
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v7
