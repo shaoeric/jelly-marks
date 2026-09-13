@@ -22,8 +22,11 @@
 - sheet 列表默认只显示 Excel 标签栏里可见的 sheet。工作簿里的隐藏 sheet
   (openpyxl 会一并读出)不会混进来;需要时勾选「显示隐藏的 sheet」查看,
   此时隐藏项带 "(隐藏)" 后缀并以灰色显示;
-- 输出文件写到所选 Excel 所在目录:
-      <文件名>-南北唛头.xlsx / <文件名>-东西唛头.xlsx
+- 输出文件写到所选 Excel 所在目录,文件名里带上所选的 sheet 名,便于同一份
+  工作簿按不同 sheet 分别生成时不互相覆盖:
+      <文件名>-<sheet名>-南北唛头.xlsx / <文件名>-<sheet名>-东西唛头.xlsx
+- 某一路(南北或东西)生成失败时不会留下文件:生成器先写临时文件,整本写完才
+  改名到位,失败时删掉临时文件、原来同名文件也不动。界面上会提示失败原因。
 - 生成在后台线程里跑,界面不会卡住。
 
 用法(项目用 uv 管理,推荐通过 uv run 启动)
@@ -87,10 +90,32 @@ def configure_stdio():
             pass
 
 
-def output_names_for(excel_path):
-    """两个输出文件名(南北 / 东西),都是纯文件名,写到所选 Excel 所在目录。"""
+def filename_part(text):
+    """把 sheet 名变成能安全放进文件名的片段(按 Windows 的命名限制)。
+
+    Windows 文件名里 <>:"/\\|?* 和控制字符都不允许;结尾的空格、点号会被系统
+    悄悄去掉,所以一并裁掉。空白(含换行)收敛成单个空格。全部被清理掉时退化成
+    下划线,避免出现空片段。
+    """
+    cleaned = "".join("_" if (ch in '<>:"/\\|?*' or ord(ch) < 32) else ch
+                      for ch in str(text or ""))
+    cleaned = " ".join(cleaned.split())
+    cleaned = cleaned.rstrip(" .")
+    while ".." in cleaned:                 # 生成脚本拒绝名字里含 ".."
+        cleaned = cleaned.replace("..", ".")
+    return cleaned or "_"
+
+
+def output_names_for(excel_path, sheet=None):
+    """两个输出文件名(南北 / 东西),都是纯文件名,写到所选 Excel 所在目录。
+
+    文件名里带上所选 sheet 名,这样同一份工作簿按不同 sheet 生成时不会互相覆盖,
+    例如 "xxx-1号-南北唛头.xlsx"。sheet 为 None 时退化成不带 sheet 的旧名字。
+    """
     stem = os.path.splitext(os.path.basename(excel_path))[0]
-    return ["%s-%s.xlsx" % (stem, NS_SUFFIX), "%s-%s.xlsx" % (stem, EW_SUFFIX)]
+    prefix = "%s-%s" % (stem, filename_part(sheet)) if sheet else stem
+    return ["%s-%s.xlsx" % (prefix, NS_SUFFIX),
+            "%s-%s.xlsx" % (prefix, EW_SUFFIX)]
 
 
 def windows_path_limit_hit(folder, names):
@@ -154,8 +179,12 @@ def run_generator(filename, module_name, excel_path, sheet, gw_sheet, out_name):
 
 
 def run_both(excel_path, sheet, gw_sheet, log=None):
-    """Generate the N/S and E/W mark workbooks; returns list of results."""
-    out_ns, out_ew = output_names_for(excel_path)
+    """Generate the N/S and E/W mark workbooks; returns list of results.
+
+    输出文件名带上 sheet 名;生成失败时生成器不会写出文件(它先写临时文件,
+    成功后才改名到位),所以失败的那一路不会留下打不开的表格。
+    """
+    out_ns, out_ew = output_names_for(excel_path, sheet)
     results = []
     for label, script, module_name, out_name in (
             ("南北", NS_SCRIPT, "marks_ns", out_ns),
@@ -441,7 +470,7 @@ class MarkPage(QWidget):
             return
         too_long = windows_path_limit_hit(
             os.path.dirname(self.excel_path),
-            output_names_for(self.excel_path))
+            output_names_for(self.excel_path, self.ns_sheet))
         if too_long:
             QMessageBox.warning(
                 self, "路径过长",

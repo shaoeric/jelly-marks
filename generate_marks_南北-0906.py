@@ -13,15 +13,23 @@ block numbers and a photo placeholder).
 Business rules (North-South only)
 1. One row on the main sheet (e.g. "Block 5-8 Packing List") = one
    combiner box (CMB.xxx):
-   - column A = box number, column B = box type,
+   - column A = box number, column B = "BOX  TYPE" (box type),
      columns D..AF = products (N/S PPH collectors + SH cables)
    - column "Drum Size" (first) = N/S drum size, e.g. 1000*350*500
      (diameter * bore * height; only diameter and height matter)
    - column "QTY 1" (first) = number of N/S drums of this box
    - EW* product columns and "QTY 2" (East-West) are ignored on purpose.
-2. The background color of the "QTY 1" cell groups drums by container;
+2. Column B must be headed "BOX  TYPE" and every box row must carry a box
+   type; otherwise the run stops with an error. Boxes are classified by
+   that value: a maximal run of consecutive same-type boxes is packed on
+   its own, so a pallet never mixes two box types while same-type boxes do
+   share pallets. Plain sheet row order no longer decides the packing, so
+   boxes of another type sitting between two same-type blocks cannot end
+   up on their pallets.
+3. The background color of the "QTY 1" cell groups drums by container;
    drums of different colors must never share a pallet.
-3. Packing per (container-color group, drum size), in sheet row order:
+4. Packing per (container-color group, drum size, box-type run), in sheet
+   row order inside a run:
    - diameter 1000 -> pallet 1050*1050*1150, 2 drums per pallet stacked;
      one leftover -> pallet 1050*1050*650
    - diameter 750  -> pallet 1500*750*1150, 4 drums per pallet (2x2);
@@ -30,10 +38,13 @@ Business rules (North-South only)
      product count is not divisible by the drum count (e.g. 5 items on
      2 drums), the whole box stays contiguous on one pallet (it may share
      a pallet with later boxes only as an indivisible block).
-4. Pallet weight = net weight of all products + pallet 25 kg
+   - the leftover partial pallets of a group's runs are then combined
+     first-fit (up to the pallet capacity), so an odd drum is not shipped
+     on a pallet of its own.
+5. Pallet weight = net weight of all products + pallet 25 kg
    + drum weight (28 kg for diameter 1000, 25 kg for 750).
    A PPH product = one RED + one BLK unit pair; the pair is counted once.
-5. Output: Marks.xlsx, one sheet per pallet (sheet name "LOT n-total").
+6. Output: Marks.xlsx, one sheet per pallet (sheet name "LOT n-total").
 
 Reusability
 - Column headers are FIXED (row1 group names PPH/SH, row2 product names,
@@ -113,9 +124,11 @@ def describe_part(pn, product_key):
     """Build the PART DESCRIPTION for a part number + product key."""
     if pn.startswith("PPH-"):
         # PPH-9.P.RED.5.00007 + "9-1 T5" -> PPH,MRTSN,WCHTA,PPH,9-1,TP5,POS,RED
-        # product keys may look like "10 -1 T1" (group joined with a dash)
+        # product keys may look like "10 -1 T1" (the 10-1 block is written
+        # with a space), so the group is the key minus the trailing type
+        # token, with the space dropped: "10 -1 T4" -> "10-1", "9-1 T1" -> "9-1"
         parts = product_key.strip().split()
-        g = "-".join(parts[:-1])
+        g = "".join(parts[:-1])
         t = parts[-1]
         tp = "TP" + t[1:] if t.startswith("T") else t
         pos_neg = "POS,RED" if ".P.RED." in pn else "NEG,BLK"
@@ -152,6 +165,8 @@ def validate_packing_list_fields(ws):
     A1/B1/C1 carry the header labels, AO/AR/AT/AU carry 'Drum Size' /
     'QTY 1' / 'Drum Size' / 'QTY 2', row2 of the product columns carries
     the product keys; the data area starts at row 6 with 'CMB...'.
+    B1 is the box type column the pallet packing is grouped by, so it is
+    checked first and with its own message.
     """
     def expect(row, col, want):
         got = norm_text(ws.cell(row=row, column=col).value)
@@ -159,8 +174,12 @@ def validate_packing_list_fields(ws):
             sys.exit("packing list header error: %s%d must be %r, got %r"
                      % (openpyxl.utils.get_column_letter(col), row, want, got))
 
+    b1_raw = ws.cell(row=1, column=2).value
+    if norm_text(b1_raw) != "BOX TYPE":
+        sys.exit("packing list header error: B1 must be 'BOX  TYPE' "
+                 "(the box type column the pallets are grouped by), got %r"
+                 % (b1_raw,))
     expect(1, 1, "COMBINER BOX NO.")
-    expect(1, 2, "BOX TYPE")
     expect(1, 3, "Harness Qty")
     expect(1, 41, "Drum Size")          # AO  (N/S drum size)
     expect(1, 44, "QTY 1")              # AR
@@ -322,6 +341,10 @@ def read_workbook(xlsx_path, sheet_name, gw_sheet):
         if not ar or not drum:
             sys.exit("row %d (%s): drum size / QTY 1 missing" % (r, name))
         ar = int(ar)
+        # column B: the box type the pallets are grouped by (rule 2)
+        box_type = norm_text(ws.cell(row=r, column=2).value)
+        if not box_type:
+            sys.exit("row %d (%s): box type (column B) is empty" % (r, name))
         raw_drum = str(drum)
         # the size cell may list several sizes one per line (mixed-size box)
         sizes = [s.strip() for s in raw_drum.split("\n") if s.strip()] \
@@ -358,7 +381,7 @@ def read_workbook(xlsx_path, sheet_name, gw_sheet):
             continue                                 # no N/S products, skip
         boxes.append({
             "row": r, "name": name,
-            "box_type": ws.cell(row=r, column=2).value,
+            "box_type": box_type,
             "axles": ar,
             "drum_sizes": drum_sizes,
             "items_per_drum": items_per_drum,
@@ -372,16 +395,17 @@ def read_workbook(xlsx_path, sheet_name, gw_sheet):
 # Pallet packing
 # ----------------------------------------------------------------------------
 def pack(entries, pallet_main, cap, pallet_rem, cap_rem):
-    """Pack drums of one container x drum-size group in sheet row order.
+    """Pack the drums of one box-type run in sheet row order.
 
-    `entries` is a list of (box, first_drum_index, drum_count) covering the
-    drums of that size group, in sheet row order. A single greedy queue:
-    drums of splittable boxes fill the open pallet, leftovers chain to the
-    next box. A non-splittable box is an indivisible block: its drums join
-    the open pallet only if they all fit at once, otherwise they get their
-    own pallet(s) in order, while the queue keeps chaining (same behavior
-    as the reference PDF). Only the final remainder of a group may use the
-    low 650-sized pallet.
+    `entries` is a list of (box, first_drum_index, drum_count) covering one
+    maximal run of same-type boxes of a (container, drum size) group, in
+    sheet row order. A single greedy queue: drums of splittable boxes fill
+    the open pallet, leftovers chain to the next box. A non-splittable box
+    is an indivisible block: its drums join the open pallet only if they all
+    fit at once, otherwise they get their own pallet(s) in order, while the
+    queue keeps chaining (same behavior as the reference PDF). Only the
+    final remainder of a run may use the low 650-sized pallet; the leftovers
+    of the group's runs are combined later by merge_leftovers().
     Returns [ {"dims": size, "chunks": [(box, first_drum, count)] } ].
     """
     pallets, cur, cur_n = [], [], 0
@@ -429,10 +453,66 @@ def pack(entries, pallet_main, cap, pallet_rem, cap_rem):
     return pallets
 
 
+def split_into_runs(entries):
+    """Split one group's entries into maximal runs of the same box type.
+
+    `entries` is a list of (box, first_drum_index, drum_count) in sheet row
+    order. A box has exactly one type, so a run ends where the type changes.
+    """
+    runs = []
+    for entry in entries:
+        if runs and runs[-1][0][0]["box_type"] == entry[0]["box_type"]:
+            runs[-1].append(entry)
+        else:
+            runs.append([entry])
+    return runs
+
+
+def drum_count(pallet):
+    """Number of drums loaded on a pallet."""
+    return sum(count for _, _, count in pallet["chunks"])
+
+
+def merge_leftovers(partials, pallet_main, cap, pallet_rem, cap_rem):
+    """Combine the leftover pallets of one (container, drum size) group.
+
+    Every box-type run leaves at most one partial pallet behind. Two
+    partials share a pallet as long as their combined drum count still fits
+    the capacity (first fit, in run order); the merged pallet is anchored on
+    the earlier box so it keeps its place in sheet order. A merged pallet is
+    re-sized for its final drum count (taller than the low leftover pallet
+    -> main size), while a leftover that stays alone keeps the size pack()
+    gave it.
+    Returns [ {"dims": size, "chunks": [...], "anchor": row} ].
+    """
+    merged = []
+    for part in partials:
+        for target in merged:
+            if not target["open"]:
+                continue
+            if drum_count(target) + drum_count(part) > cap:
+                continue
+            target["chunks"].extend(part["chunks"])
+            target["anchor"] = min(target["anchor"], part["anchor"])
+            target["open"] = drum_count(target) < cap
+            target["dims"] = (pallet_main if drum_count(target) > cap_rem
+                              else pallet_rem)
+            break
+        else:
+            merged.append({"dims": part["dims"],
+                           "chunks": list(part["chunks"]),
+                           "anchor": part["anchor"],
+                           "open": drum_count(part) < cap})
+    return merged
+
+
 def build_pallets(boxes, pallet_sizes):
     """Group drums by (container color, drum size); group order = first
-    appearance. A box with several drum sizes contributes to each group.
-    Within a group, pallets are ordered by the sheet row of their first box.
+    appearance. Inside a group the drums are packed per box type: a maximal
+    run of consecutive same-type boxes is packed on its own, then the
+    leftover partials of the group's runs are combined. A box with several
+    drum sizes contributes to each group. Within a group, pallets are
+    ordered by the sheet row of their first box.
     """
     groups = OrderedDict()            # (container, size) -> [(box, start, n)]
     for b in boxes:
@@ -447,12 +527,16 @@ def build_pallets(boxes, pallet_sizes):
     pallets = []
     for (container, drum), entries in groups.items():
         pallet_main, cap, pallet_rem, cap_rem = pallet_sizes[drum]
-        grouped = []
-        for p in pack(entries, pallet_main, cap, pallet_rem, cap_rem):
-            p["anchor"] = min(b["row"] for b, _, _ in p["chunks"])
-            grouped.append({"container": container, "drum": drum, **p})
+        full, partials = [], []
+        for run in split_into_runs(entries):
+            for p in pack(run, pallet_main, cap, pallet_rem, cap_rem):
+                p["anchor"] = min(b["row"] for b, _, _ in p["chunks"])
+                (partials if drum_count(p) < cap else full).append(p)
+        grouped = full + merge_leftovers(partials, pallet_main, cap,
+                                         pallet_rem, cap_rem)
         grouped.sort(key=lambda p: p["anchor"])
-        pallets.extend(grouped)
+        pallets.extend({"container": container, "drum": drum, **p}
+                       for p in grouped)
     return pallets
 
 
@@ -467,22 +551,24 @@ def short_key_of(pn, products):
 def pallet_items(chunks, products):
     """Pallet item list: sum the per-drum item counts for the drums on it.
 
-    A PPH drum carries one RED and one BLK item of each kind (same qty).
+    Lines follow the product column order of the packing list (D..AM), not
+    the order the boxes were added to the pallet, so a pallet combining two
+    boxes always lists the parts the same way. A PPH drum carries one RED
+    and one BLK item of each kind (same qty), listed as RED then BLK.
     """
-    merged = OrderedDict()                           # part number -> quantity
+    qty_by_key = OrderedDict()                       # product key -> quantity
     for box, off, n in chunks:
         for per in box["items_per_drum"][off:off + n]:
             for key, qty in per.items():
-                pn_r = pn_b = None
-                for k2, pn_r2, pn_b2, typ2 in products:
-                    if k2 == key:
-                        pn_r, pn_b, typ = pn_r2, pn_b2, typ2
-                        break
-                if typ == "PPH":
-                    merged[pn_r] = merged.get(pn_r, 0) + qty
-                    merged[pn_b] = merged.get(pn_b, 0) + qty
-                else:
-                    merged[pn_r] = merged.get(pn_r, 0) + qty
+                qty_by_key[key] = qty_by_key.get(key, 0) + qty
+    merged = OrderedDict()                           # part number -> quantity
+    for key, pn_r, pn_b, typ in products:            # column order
+        qty = qty_by_key.get(key, 0)
+        if not qty:
+            continue
+        merged[pn_r] = merged.get(pn_r, 0) + qty
+        if typ == "PPH" and pn_b:
+            merged[pn_b] = merged.get(pn_b, 0) + qty
     items = []
     for pn, qty in merged.items():
         desc = CONFIG["descriptions"].get(pn) or describe_part(
@@ -581,7 +667,28 @@ def write_mark_sheet(ws, cfg, lot, total, items, weight, dims, blocks):
     ws.freeze_panes = "A1"
 
 
+def save_workbook(wb, path):
+    """Save the workbook without ever leaving a half-written file behind.
+
+    openpyxl truncates the target as soon as it opens it, so an error in the
+    middle of saving used to leave an unreadable file under the requested
+    name. Write a sibling temp file first and move it into place only once
+    the workbook is complete; on failure drop the temp file and leave
+    whatever was at `path` untouched.
+    """
+    tmp_path = path + ".part.xlsx"
+    try:
+        wb.save(tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
 def make_workbook(path, pallets, cfg):
+    if not pallets:
+        sys.exit("nothing to write: no pallet could be built from this sheet")
     wb = openpyxl.Workbook()
     wb.remove(wb.active)                             # drop default empty sheet
     total = len(pallets)
@@ -591,7 +698,7 @@ def make_workbook(path, pallets, cfg):
         ws = wb.create_sheet(title="LOT %d-%d" % (i, total))
         write_mark_sheet(ws, cfg, i, total, p["items"], p["weight"],
                          [int(x) for x in p["dims"].split("*")], blocks)
-    wb.save(path)
+    save_workbook(wb, path)
 
 
 # ----------------------------------------------------------------------------

@@ -533,7 +533,28 @@ def write_mark_sheet(ws, cfg, lot, total, items, weight, dims, blocks):
     ws.freeze_panes = "A1"
 
 
+def save_workbook(wb, path):
+    """Save the workbook without ever leaving a half-written file behind.
+
+    openpyxl truncates the target as soon as it opens it, so an error in the
+    middle of saving used to leave an unreadable file under the requested
+    name. Write a sibling temp file first and move it into place only once
+    the workbook is complete; on failure drop the temp file and leave
+    whatever was at `path` untouched.
+    """
+    tmp_path = path + ".part.xlsx"
+    try:
+        wb.save(tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
 def make_workbook(path, pallets, cfg):
+    if not pallets:
+        sys.exit("nothing to write: no pallet could be built from this sheet")
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     total = len(pallets)
@@ -544,7 +565,7 @@ def make_workbook(path, pallets, cfg):
         ws = wb.create_sheet(title="LOT %d-%d" % (i, total))
         write_mark_sheet(ws, cfg, i, total, p["items"], p["weight"],
                          [int(x) for x in p["dims"].split("*")], blocks)
-    wb.save(path)
+    save_workbook(wb, path)
 
 
 # ----------------------------------------------------------------------------
@@ -580,6 +601,9 @@ def main():
 
     groups, products, unit_weight = read_workbook(
         xlsx_path, args.sheet, args.gw_sheet)
+    if not groups:
+        sys.exit("sheet '%s' has no East-West harness data: columns EW1..EW7 "
+                 "are empty (nothing to generate)" % args.sheet)
     pallets = build_pallets(groups, cfg["pallet_sizes"])
 
     for p in pallets:
