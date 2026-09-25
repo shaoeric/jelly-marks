@@ -27,12 +27,13 @@ import os
 EXE_NAME = "XiaoXiaoTool"
 ENTRY_SCRIPT = "gui_marks.py"
 
-# 这两个生成脚本没有在 gui_marks.py 里 import,而是运行时按文件名动态加载
+# 这些生成脚本没有在 gui_marks.py 里 import,而是运行时按文件名动态加载
 # (见 gui_marks.py 的 load_generator),静态分析看不到,必须作为数据文件带上。
 # 冻结后它们会落在 sys._MEIPASS,正好是 app_dir() 查找的位置。
 GENERATOR_SCRIPTS = [
     "generate_marks_南北-0906.py",
     "generate_marks_东西-0906.py",
+    "generate_asn_0904.py",
 ]
 
 # 生成脚本自己的依赖,同样因为动态加载不会被自动发现,需要显式声明。

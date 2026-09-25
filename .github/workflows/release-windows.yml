@@ -73,7 +73,8 @@ jobs:
 
           # 生成脚本是运行时按文件名动态加载的数据文件,漏了 exe 就跑不起来
           for need in ("generate_marks_南北-0906.py",
-                       "generate_marks_东西-0906.py"):
+                       "generate_marks_东西-0906.py",
+                       "generate_asn_0904.py"):
               if not any(need in n for n in names):
                   raise SystemExit("::error::包内缺少生成脚本: %s" % need)
 

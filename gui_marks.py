@@ -7,9 +7,12 @@
 一个 PySide6 桌面工具「小小工具」:主窗口左侧是功能栏,点选其中一项即
 在右侧区域显示对应功能页,不新开窗口,也不占用系统菜单栏。
 
-当前已装功能「小小唛头-wichita」:选择 Excel 文件,列出所有 sheet,
-指定其中一个为 packing list sheet、另一个为 gw sheet(两者不能相同),
-然后一键生成南北唛头 Excel 和东西唛头 Excel。
+当前已装功能:
+- 「小小唛头-wichita」:选择 Excel 文件,列出所有 sheet,指定其中一个为
+  packing list sheet、另一个为 gw sheet(两者不能相同),然后一键生成
+  南北唛头 Excel 和东西唛头 Excel。
+- 「ASN0904-中秋节快乐」:选择唛头 Excel 与 ASN 导出 Excel,指定 ASN 数据
+  sheet 与单位重量 sheet,一键生成可上传 ASN 系统的 ASN_Template 表格。
 
 增加新功能的方式:写一个功能页 Widget,在 MainWindow 里用 _add_feature
 注册即可(左侧栏与右侧页面会同时加好)。
@@ -64,11 +67,15 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "小小工具"
 MARKS_FEATURE_NAME = "小小唛头-wichita"
+ASN_FEATURE_NAME = "ASN0904-中秋节快乐"
 
 NS_SCRIPT = "generate_marks_南北-0906.py"
 EW_SCRIPT = "generate_marks_东西-0906.py"
 NS_SUFFIX = "南北唛头"
 EW_SUFFIX = "东西唛头"
+
+ASN_SCRIPT = "generate_asn_0904.py"
+ASN_OUT_SUFFIX = "ASN_Template上传"
 
 
 def configure_stdio():
@@ -116,6 +123,13 @@ def output_names_for(excel_path, sheet=None):
     prefix = "%s-%s" % (stem, filename_part(sheet)) if sheet else stem
     return ["%s-%s.xlsx" % (prefix, NS_SUFFIX),
             "%s-%s.xlsx" % (prefix, EW_SUFFIX)]
+
+
+def asn_default_out_path(asn_path):
+    """ASN 功能页输出文件的默认位置:与 ASN 文件同目录,文件名加后缀。"""
+    stem = filename_part(os.path.splitext(os.path.basename(asn_path))[0])
+    return os.path.join(os.path.dirname(asn_path),
+                        "%s-%s.xlsx" % (stem, ASN_OUT_SUFFIX))
 
 
 def windows_path_limit_hit(folder, names):
@@ -176,6 +190,39 @@ def run_generator(filename, module_name, excel_path, sheet, gw_sheet, out_name):
     finally:
         sys.argv, sys.stdout = old_argv, old_stdout
         os.chdir(old_cwd)
+
+
+def run_asn_generator(marks_path, asn_path, asn_sheet, weight_sheet, out_path):
+    """运行 generate_asn_0904.py 的 main();返回 (ok, message)。
+
+    生成器把校验问题打到 stderr、成功信息打到 stdout,这里一并捕获,
+    供界面日志与弹窗使用;路径一律用绝对路径传入。
+    """
+    module = load_generator(ASN_SCRIPT, "asn0904")
+    buf = io.StringIO()
+    old_argv = sys.argv
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.argv = [ASN_SCRIPT,
+                "--mark-path", marks_path, "--asn-path", asn_path,
+                "--asn-sheet", asn_sheet, "--weight-sheet", weight_sheet,
+                "--out", out_path]
+    sys.stdout = buf
+    sys.stderr = buf
+    try:
+        module.main()
+        return True, buf.getvalue()
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            return False, "已中止\n" + buf.getvalue()
+        # sys.exit("原因") 时原因没进 stderr,要单独补上;纯退出码(如 1)不用
+        detail = str(exc.code)
+        prefix = detail + "\n" if not detail.isdigit() else ""
+        return False, prefix + buf.getvalue()
+    except Exception:
+        return False, traceback.format_exc() + "\n" + buf.getvalue()
+    finally:
+        sys.argv = old_argv
+        sys.stdout, sys.stderr = old_stdout, old_stderr
 
 
 def run_both(excel_path, sheet, gw_sheet, log=None):
@@ -316,7 +363,7 @@ class MarkPage(QWidget):
         self.btn_set_gw.clicked.connect(lambda: self.set_sheet("gw"))
         pick_layout.addWidget(self.btn_set_gw)
 
-        hint = QLabel("提示: 两个 sheet 不能相同;可随时重新选择文件", pick)
+        hint = QLabel("提示: 两个 sheet 不能相同;\n可随时重新选择文件", pick)
         hint.setStyleSheet("color: #666666;")
         hint.setWordWrap(True)
         pick_layout.addWidget(hint)
@@ -505,6 +552,369 @@ class MarkPage(QWidget):
                             for r in results if not r["ok"])
             QMessageBox.critical(self, "生成失败", bad)
 
+class AsnWorker(QThread):
+    """在后台线程里跑 ASN 生成器,产物是单个输出文件。"""
+
+    finished_with = Signal(dict)
+
+    def __init__(self, marks_path, asn_path, asn_sheet, weight_sheet,
+                 out_path, parent=None):
+        super().__init__(parent)
+        self.marks_path = marks_path
+        self.asn_path = asn_path
+        self.asn_sheet = asn_sheet
+        self.weight_sheet = weight_sheet
+        self.out_path = out_path
+
+    def run(self):
+        try:
+            ok, message = run_asn_generator(self.marks_path, self.asn_path,
+                                            self.asn_sheet, self.weight_sheet,
+                                            self.out_path)
+        except Exception:
+            ok, message = False, traceback.format_exc()
+        self.finished_with.emit({"ok": ok, "message": message,
+                                 "out_path": self.out_path})
+
+
+class AsnPage(QWidget):
+    """ASN 功能页(ASN0904-中秋节快乐): 唛头 + ASN 导出 -> ASN_Template 上传表。
+
+    要选的东西比唛头页多一个文件: 唛头 Excel、ASN 导出的 Excel、ASN 里
+    作为数据来源的 sheet、单位重量 sheet,以及输出文件。
+    """
+
+    status_changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.marks_path = None
+        self.asn_path = None
+        self.sheet_names = []
+        self.data_sheet = None
+        self.weight_sheet = None
+        self.out_path = None
+        self.auto_out_path = None      # 最近一次自动填的默认输出路径
+        self.worker = None
+        self._build_ui()
+
+    def is_busy(self):
+        return self.worker is not None and self.worker.isRunning()
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(6)
+
+        header = QLabel(ASN_FEATURE_NAME, self)
+        header_font = QFont()
+        header_font.setPointSize(15)
+        header_font.setBold(True)
+        header.setFont(header_font)
+        outer.addWidget(header)
+
+        marks_box = QGroupBox("唛头 Excel(每个 sheet = 1 个托盘)", self)
+        marks_row = QHBoxLayout(marks_box)
+        self.btn_marks = QPushButton("选择唛头 Excel 文件…", marks_box)
+        self.btn_marks.clicked.connect(self.choose_marks_file)
+        marks_row.addWidget(self.btn_marks)
+        self.marks_label = QLabel("(未选择文件)", marks_box)
+        self.marks_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        marks_row.addWidget(self.marks_label, 1)
+        outer.addWidget(marks_box)
+
+        asn_box = QGroupBox("ASN 导出的 Excel", self)
+        asn_row = QHBoxLayout(asn_box)
+        self.btn_asn = QPushButton("选择 ASN Excel 文件…", asn_box)
+        self.btn_asn.clicked.connect(self.choose_asn_file)
+        asn_row.addWidget(self.btn_asn)
+        self.asn_label = QLabel("(未选择文件)", asn_box)
+        self.asn_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        asn_row.addWidget(self.asn_label, 1)
+        outer.addWidget(asn_box)
+
+        mid = QHBoxLayout()
+        mid.setSpacing(10)
+        outer.addLayout(mid, 1)
+
+        list_box = QGroupBox("ASN 里的 Sheet 列表", self)
+        list_layout = QVBoxLayout(list_box)
+        self.sheet_list = QListWidget(list_box)
+        self.sheet_list.setSelectionMode(
+            QListWidget.SelectionMode.SingleSelection)
+        self.sheet_list.itemDoubleClicked.connect(self._on_row_double_clicked)
+        list_layout.addWidget(self.sheet_list)
+        mid.addWidget(list_box, 1)
+
+        pick = QGroupBox("已选 sheet", self)
+        pick_layout = QVBoxLayout(pick)
+
+        data_row = QHBoxLayout()
+        data_row.addWidget(QLabel("ASN 数据 sheet:", pick))
+        self.data_label = QLabel("(未选择)", pick)
+        self.data_label.setStyleSheet("color: #0055aa;")
+        # sheet 名可能很长,允许换行,避免被裁掉
+        self.data_label.setWordWrap(True)
+        data_row.addWidget(self.data_label, 1)
+        self.btn_data_clear = QPushButton("清除", pick)
+        self.btn_data_clear.setFixedWidth(64)
+        self.btn_data_clear.clicked.connect(lambda: self.clear_sheet("data"))
+        data_row.addWidget(self.btn_data_clear)
+        pick_layout.addLayout(data_row)
+
+        weight_row = QHBoxLayout()
+        weight_row.addWidget(QLabel("单位重量 sheet:", pick))
+        self.weight_label = QLabel("(未选择)", pick)
+        self.weight_label.setStyleSheet("color: #0055aa;")
+        self.weight_label.setWordWrap(True)
+        weight_row.addWidget(self.weight_label, 1)
+        self.btn_weight_clear = QPushButton("清除", pick)
+        self.btn_weight_clear.setFixedWidth(64)
+        self.btn_weight_clear.clicked.connect(lambda: self.clear_sheet("weight"))
+        weight_row.addWidget(self.btn_weight_clear)
+        pick_layout.addLayout(weight_row)
+
+        pick_layout.addSpacing(12)
+        self.btn_set_data = QPushButton("把列表中选中的 sheet 设为 ASN 数据 sheet", pick)
+        self.btn_set_data.clicked.connect(lambda: self.set_sheet("data"))
+        pick_layout.addWidget(self.btn_set_data)
+        self.btn_set_weight = QPushButton("把列表中选中的 sheet 设为 单位重量 sheet", pick)
+        self.btn_set_weight.clicked.connect(lambda: self.set_sheet("weight"))
+        pick_layout.addWidget(self.btn_set_weight)
+
+        # 显式换行且每行都短: 高度不随宽度变化,布局里不会被压成半行
+        hint = QLabel("提示: 两个 sheet 都来自 ASN 的 Excel;\n"
+                      "数据 sheet 是 A-AE 列;\n"
+                      "单位重量 sheet 无表头,只有 2 列",
+                      pick)
+        hint.setStyleSheet("color: #666666;")
+        hint.setWordWrap(True)
+        pick_layout.addWidget(hint)
+        pick_layout.addStretch(1)
+        mid.addWidget(pick, 1)
+
+        out_box = QGroupBox("输出文件", self)
+        out_row = QHBoxLayout(out_box)
+        self.btn_out = QPushButton("选择输出文件…", out_box)
+        self.btn_out.clicked.connect(self.choose_out_file)
+        out_row.addWidget(self.btn_out)
+        self.out_label = QLabel("(未选择)", out_box)
+        self.out_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        out_row.addWidget(self.out_label, 1)
+        outer.addWidget(out_box)
+
+        self.btn_run = QPushButton("生成 ASN_Template 上传表", self)
+        self.btn_run.clicked.connect(self.on_generate)
+        outer.addWidget(self.btn_run)
+
+        self.log_text = QPlainTextEdit(self)
+        self.log_text.setReadOnly(True)
+        log_font = QFontDatabase.systemFont(
+            QFontDatabase.SystemFont.FixedFont)
+        log_font.setPointSize(12)
+        self.log_text.setFont(log_font)
+        # 这一页比唛头页多两行文件选择,日志区留小一点,避免整页被压扁
+        self.log_text.setMinimumHeight(120)
+        outer.addWidget(self.log_text, 1)
+
+    # ------------------------------------------------------------- actions
+    def _log(self, text):
+        self.log_text.appendPlainText(text.rstrip())
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _refresh_labels(self):
+        self.data_label.setText(self.data_sheet or "(未选择)")
+        self.weight_label.setText(self.weight_sheet or "(未选择)")
+        self.out_label.setText(self.out_path or "(未选择)")
+
+    def _set_busy(self, busy):
+        for widget in (self.btn_marks, self.btn_asn, self.btn_out, self.btn_run,
+                       self.btn_set_data, self.btn_set_weight,
+                       self.btn_data_clear, self.btn_weight_clear):
+            widget.setEnabled(not busy)
+        self.status_changed.emit("生成中…" if busy else "就绪")
+
+    def _pick_excel(self, title):
+        path, _ = QFileDialog.getOpenFileName(
+            self, title, "",
+            "Excel 文件 (*.xlsx *.xlsm);;所有文件 (*)")
+        return path
+
+    def choose_marks_file(self):
+        if self.is_busy():
+            return
+        path = self._pick_excel("选择唛头 Excel 文件")
+        if not path:
+            return
+        self.marks_path = path
+        self.marks_label.setText(path)
+        self._log("已选择唛头文件: %s" % path)
+
+    def choose_asn_file(self):
+        if self.is_busy():
+            return
+        path = self._pick_excel("选择 ASN 导出的 Excel 文件")
+        if not path:
+            return
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            names = list(wb.sheetnames)
+            wb.close()
+        except Exception as exc:
+            QMessageBox.critical(self, "无法打开文件", "%s\n\n%s" % (path, exc))
+            return
+        self.asn_path = path
+        self.sheet_names = names
+        self.data_sheet = None
+        self.weight_sheet = None
+        self.asn_label.setText(path)
+        self._populate_sheet_list()
+        # 输出默认落在 ASN 文件同目录,换成别的工作簿时会跟着更新
+        if self.out_path is None or self.out_path == self.auto_out_path:
+            self.auto_out_path = asn_default_out_path(path)
+            self.out_path = self.auto_out_path
+        self._refresh_labels()
+        self._log("已选择 ASN 文件: %s" % path)
+        self._log("sheet(%d): %s" % (len(names), ", ".join(names)))
+
+    def _populate_sheet_list(self):
+        self.sheet_list.clear()
+        for name in self.sheet_names:
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            self.sheet_list.addItem(item)
+
+    def _selected_sheet(self):
+        item = self.sheet_list.currentItem()
+        if item is None or not item.isSelected():
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _on_row_double_clicked(self, _item):
+        """双击一行: 优先填 ASN 数据 sheet,已填则填单位重量 sheet。"""
+        if self.data_sheet is None:
+            self.set_sheet("data")
+        elif self.weight_sheet is None:
+            self.set_sheet("weight")
+
+    def set_sheet(self, which):
+        if self.is_busy():
+            return
+        if not self.asn_path:
+            QMessageBox.warning(self, "提示", "请先选择 ASN 导出的 Excel 文件")
+            return
+        name = self._selected_sheet()
+        if name is None:
+            QMessageBox.warning(self, "提示", "请先在左侧列表中选择一个 sheet")
+            return
+        other = self.weight_sheet if which == "data" else self.data_sheet
+        if other == name:
+            QMessageBox.warning(self, "提示",
+                                "ASN 数据 sheet 与 单位重量 sheet 不能相同")
+            return
+        if which == "data":
+            self.data_sheet = name
+        else:
+            self.weight_sheet = name
+        self._refresh_labels()
+        self._log("已设置 %s = %s"
+                  % ("ASN 数据 sheet" if which == "data" else "单位重量 sheet",
+                     name))
+
+    def clear_sheet(self, which):
+        if self.is_busy():
+            return
+        if which == "data":
+            self.data_sheet = None
+        else:
+            self.weight_sheet = None
+        self._refresh_labels()
+        self._log("已清除 %s"
+                  % ("ASN 数据 sheet" if which == "data" else "单位重量 sheet"))
+
+    def choose_out_file(self):
+        if self.is_busy():
+            return
+        default = self.out_path or (asn_default_out_path(self.asn_path)
+                                    if self.asn_path else "ASN_Template上传.xlsx")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "选择输出文件", default, "Excel 文件 (*.xlsx)")
+        if not path:
+            return
+        self.out_path = path
+        self._refresh_labels()
+        self._log("输出文件: %s" % path)
+
+    def on_generate(self):
+        if self.is_busy():
+            return
+        if not self.marks_path:
+            QMessageBox.warning(self, "提示", "请先选择唛头 Excel 文件")
+            return
+        if not self.asn_path:
+            QMessageBox.warning(self, "提示", "请先选择 ASN 导出的 Excel 文件")
+            return
+        if not self.data_sheet or not self.weight_sheet:
+            QMessageBox.warning(self, "提示",
+                                "请分别选择 ASN 数据 sheet 和 单位重量 sheet")
+            return
+        if self.data_sheet == self.weight_sheet:
+            QMessageBox.warning(self, "提示",
+                                "ASN 数据 sheet 与 单位重量 sheet 不能相同")
+            return
+        if not self.out_path:
+            QMessageBox.warning(self, "提示", "请先选择输出文件")
+            return
+        out_real = os.path.realpath(self.out_path)
+        for label, path in (("唛头", self.marks_path), ("ASN", self.asn_path)):
+            if out_real == os.path.realpath(path):
+                QMessageBox.warning(self, "提示",
+                                    "输出文件不能覆盖%s输入的 Excel" % label)
+                return
+        too_long = windows_path_limit_hit(
+            os.path.dirname(self.out_path), [os.path.basename(self.out_path)])
+        if too_long:
+            QMessageBox.warning(
+                self, "路径过长",
+                "Windows 下完整路径超过 260 个字符就无法保存文件:\n\n%s\n\n"
+                "当前 %d 个字符。请换一个层级更浅的输出目录后重试。"
+                % (too_long, len(too_long)))
+            return
+
+        self._set_busy(True)
+        self._log("=" * 60)
+        self._log("唛头文件: %s" % self.marks_path)
+        self._log("ASN 文件: %s" % self.asn_path)
+        self._log("ASN 数据 sheet: %s" % self.data_sheet)
+        self._log("单位重量 sheet: %s" % self.weight_sheet)
+        self._log("输出文件: %s" % self.out_path)
+        self.worker = AsnWorker(self.marks_path, self.asn_path,
+                                self.data_sheet, self.weight_sheet,
+                                self.out_path, self)
+        self.worker.finished_with.connect(self._on_done)
+        self.worker.start()
+
+    def _on_done(self, result):
+        self._set_busy(False)
+        self._log(result["message"].rstrip())
+        if result["ok"]:
+            self._log("输出: %s" % result["out_path"])
+            QMessageBox.information(self, "完成",
+                                    "已生成:\n%s" % result["out_path"])
+        else:
+            failed = result["message"].strip() or "生成失败"
+            lines = failed.splitlines()
+            if len(lines) > 20:           # 校验问题可能很多,弹窗只显示开头
+                failed = "\n".join(lines[:20] + ["…(完整信息见下方日志)"])
+            QMessageBox.critical(self, "生成失败", failed)
+
+
 class MainWindow(QMainWindow):
     """主窗口「小小工具」。
 
@@ -517,11 +927,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(900, 700)
+        # ASN 页比唛头页多两行文件选择,默认开大一点,免得各控件被纵向压扁
+        self.resize(960, 760)
         self.setMinimumSize(780, 560)
 
         self.mark_page = MarkPage(self)
         self.mark_page.status_changed.connect(self._on_status)
+        self.asn_page = AsnPage(self)
+        self.asn_page.status_changed.connect(self._on_status)
 
         self.stack = QStackedWidget(self)
         self.nav = QListWidget(self)
@@ -529,6 +942,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._add_feature("首页", self._build_home())
         self._add_feature(MARKS_FEATURE_NAME, self.mark_page)
+        self._add_feature(ASN_FEATURE_NAME, self.asn_page)
         self.nav.setCurrentRow(0)
 
     # ------------------------------------------------------------------ UI
@@ -596,8 +1010,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(hint)
 
         layout.addSpacing(20)
-        features = QLabel("已安装功能: %s(生成南北 / 东西唛头)"
-                          % MARKS_FEATURE_NAME, page)
+        features = QLabel("已安装功能: %s(生成南北 / 东西唛头)、%s(生成 ASN_Template)"
+                          % (MARKS_FEATURE_NAME, ASN_FEATURE_NAME), page)
         features.setAlignment(Qt.AlignmentFlag.AlignCenter)
         features.setStyleSheet("color: #888888;")
         layout.addWidget(features)
@@ -625,7 +1039,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(text)
 
     def closeEvent(self, event):
-        if self.mark_page.is_busy():
+        if self.mark_page.is_busy() or self.asn_page.is_busy():
             QMessageBox.warning(self, "提示", "正在生成,请等待完成后再关闭")
             event.ignore()
             return

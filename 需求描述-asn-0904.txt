@@ -1,0 +1,26 @@
+我要根据唛头excel文件、ASN系统导出的excel文件，生成可以上传到ASN系统的excel表格，每种excel的情况如下：
+
+# 1. 输入
+
+1.1 唛头excel文件示例 "cases/case2/Wichita Batch4-唛头(2).xlsx" 每个sheet是一个托盘装的货物、总重、托盘尺寸等，如第一个托盘（sheet 1） 共有7个货物，分别是"PPH-9.P.RED.5.00003"、"PPH-9.N.BLK.0.00003"、"PPH-9.P.RED.5.00004"、"PPH-9.N.BLK.0.00004"、"SH-2.8.RED.BLK.00003"、"SH-2.8.RED.BLK.00006"、"SH-2.8.RED.BLK.00011"， 个数分别是 6、6、2、2、2、2、2，对应第10-16行的A列和C列，托盘总重是 465.34，尺寸是 1050 x 1050 x 1150 mm 。
+
+1.2 ASN系统导出的excel表格是 “cases/case2/ASN_Bulk_Template_Batch4 9-24_核对修正.xlsx” 的 名为 “ASN_Template (2)” 的 sheet，带有A-AE 列，包含了所有 part-number 货物的所需要的数据。 
+
+1.3 ASN系统导出的excel表格是 “cases/case2/ASN_Bulk_Template_Batch4 9-24_核对修正.xlsx” 的 名为 “Sheet1” sheet 记录了每个 part-number 的单位重量
+
+# 2. 输出
+
+ASN系统导出的excel表格是 “cases/case2/ASN_Bulk_Template_Batch4 9-24_核对修正.xlsx” 的 "ASN_Template" sheet 是需要交付生成的表格，输出的表格 可以不在这个表格中作为一个sheet来做 （目前只是方便人工做vlookup）。 要求 表格的列名、数量完全对应。 计算流程：
+- 唛头中 第1个托盘包含7个货物， 所以前7行的 AB列 “package_id” 都是1
+- S列 allowed_qty 是从 “ASN_Template (2)” sheet中读取出来的，比如 "PPH-9.P.RED.5.00003" 的 allowed_qty 都是 677
+- V列 items_per_package 是从 唛头中的对应托盘号的 sheet 中 读取出来的，所以 “package_id”为1的前七行 的数量是 6、6、2、2、2、2、2
+- W列 net_weight_per_package 的数值 = V列的数量 * 对应part-number 的单位重量， 所以 package_id 为1的重量为=7.475*6+7.475*6+7.795*2+7.795*2+22.29*2+43.76*2+65.68*2=384.34 ，如 W列第2行，且只写在这个托盘的第1行的单元格上，其他行的单元格空着
+- X列 gross_weight_per_package 是从唛头的对应托盘sheet中来的，如 package_id=10时，为10号托盘，从 唛头的 第10个sheet中读取，总重为 397.7
+- Z列 dimensions 是当前货物所属托盘的尺寸，需要注意符号使用的是 *
+
+# 要求
+1. 需要用户指定唛头的路径，对唛头文件的所有sheet做校验
+    - 判断是否有重复
+    - 校验8A单元格的字符串为"LOT NUMBER"，8B是该字段的数据。 LOT NUMBER 的格式 托盘号-托盘总数 ，如 sheet “40 ” 的 LOT NUMBER 为“40-114”，表示当前是第40个托盘，是第40个sheet，总共有114个sheet； sheet “1 (2)” 的 LOT NUMBER 为 41-114 ，表示当前是第41个托盘。 所以需要校验每一页的sheet号和当前托盘号是否相等，每一页的托盘总数是否等于sheet总数
+2. 需要用户指定 ASN导出的excel表格路径、导出的数据"ASN_Template (2)"的sheet名，需要校验 该sheet的列名顺序、字符串是否严格相同； 需要用户指定 货物的单位重量的sheet名，无首行表头模式，需要校验只有2列数据，A列是part-number名字，B列是对应的单位重量，需要校验B列是正浮点数； 需要校验该ASN中的每个part-number都在单位重量的表中可以查到
+3. 需要用户指定 输出ASN的excel表格的路径，需要确保与上面指定的路径不一致，字段名、顺序都直接按照现在参考示例直接写死
