@@ -13,13 +13,16 @@
   南北唛头 Excel 和东西唛头 Excel。
 - 「ASN0904-中秋节快乐」:选择唛头 Excel 与 ASN 导出 Excel,指定 ASN 数据
   sheet 与单位重量 sheet,一键生成可上传 ASN 系统的 ASN_Template 表格。
+- 「N20-唛头」:选择线束计算表(Combined POS)与装箱明细(Sheet1 (2))两份
+  Excel,各自指定 sheet,一键生成"一个托盘一个 sheet"的 N20 唛头。
 
 增加新功能的方式:写一个功能页 Widget,在 MainWindow 里用 _add_feature
 注册即可(左侧栏与右侧页面会同时加好)。
 
 特点
 - 不修改现有生成脚本:运行时动态加载并调用
-  generate_marks_南北-0906.py / generate_marks_东西-0906.py 的 main(),
+  generate_marks_南北-0906.py / generate_marks_东西-0906.py /
+  generate_asn_0904.py / generate_n20.py 的 main(),
   完全复用它们读表、校验、算柜、生成的工作流;
 - 可以随时重新选择文件,或单独清除已选的 sheet;
 - sheet 列表默认只显示 Excel 标签栏里可见的 sheet。工作簿里的隐藏 sheet
@@ -68,6 +71,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "小小工具"
 MARKS_FEATURE_NAME = "小小唛头-wichita"
 ASN_FEATURE_NAME = "ASN0904-中秋节快乐"
+N20_FEATURE_NAME = "N20-唛头"
 
 NS_SCRIPT = "generate_marks_南北-0906.py"
 EW_SCRIPT = "generate_marks_东西-0906.py"
@@ -76,6 +80,11 @@ EW_SUFFIX = "东西唛头"
 
 ASN_SCRIPT = "generate_asn_0904.py"
 ASN_OUT_SUFFIX = "ASN_Template上传"
+
+N20_SCRIPT = "generate_n20.py"
+N20_COMBINED_SHEET = "Combined POS"
+N20_PALLET_SHEET = "Sheet1 (2)"
+N20_OUT_SUFFIX = "唛头"
 
 
 def configure_stdio():
@@ -130,6 +139,13 @@ def asn_default_out_path(asn_path):
     stem = filename_part(os.path.splitext(os.path.basename(asn_path))[0])
     return os.path.join(os.path.dirname(asn_path),
                         "%s-%s.xlsx" % (stem, ASN_OUT_SUFFIX))
+
+
+def n20_default_out_path(pallet_path):
+    """N20 功能页输出唛头的默认位置:与装箱明细同目录,文件名加"唛头"。"""
+    stem = filename_part(os.path.splitext(os.path.basename(pallet_path))[0])
+    return os.path.join(os.path.dirname(pallet_path),
+                        "%s-%s.xlsx" % (stem, N20_OUT_SUFFIX))
 
 
 def windows_path_limit_hit(folder, names):
@@ -215,6 +231,41 @@ def run_asn_generator(marks_path, asn_path, asn_sheet, weight_sheet, out_path):
         if exc.code in (None, 0):
             return False, "已中止\n" + buf.getvalue()
         # sys.exit("原因") 时原因没进 stderr,要单独补上;纯退出码(如 1)不用
+        detail = str(exc.code)
+        prefix = detail + "\n" if not detail.isdigit() else ""
+        return False, prefix + buf.getvalue()
+    except Exception:
+        return False, traceback.format_exc() + "\n" + buf.getvalue()
+    finally:
+        sys.argv = old_argv
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+
+
+def run_n20_generator(combined_path, combined_sheet, pallet_path,
+                      pallet_sheet, out_path):
+    """运行 generate_n20.py 的 main();返回 (ok, message)。
+
+    两个输入文件、各自的 sheet 名、输出唛头路径都从界面传入;
+    生成器的校验问题用 sys.exit("原因") 抛出,这里把原因和日志一并交给界面。
+    """
+    module = load_generator(N20_SCRIPT, "n20_marks")
+    buf = io.StringIO()
+    old_argv = sys.argv
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.argv = [N20_SCRIPT,
+                "--combined", combined_path,
+                "--combined-sheet", combined_sheet,
+                "--pallet", pallet_path,
+                "--pallet-sheet", pallet_sheet,
+                "--out", out_path]
+    sys.stdout = buf
+    sys.stderr = buf
+    try:
+        module.main()
+        return True, buf.getvalue()
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            return False, "已中止\n" + buf.getvalue()
         detail = str(exc.code)
         prefix = detail + "\n" if not detail.isdigit() else ""
         return False, prefix + buf.getvalue()
@@ -915,6 +966,305 @@ class AsnPage(QWidget):
             QMessageBox.critical(self, "生成失败", failed)
 
 
+class N20Worker(QThread):
+    """在后台线程里跑 N20 唛头生成器,产物是单个唛头工作簿。"""
+
+    finished_with = Signal(dict)
+
+    def __init__(self, combined_path, combined_sheet, pallet_path,
+                 pallet_sheet, out_path, parent=None):
+        super().__init__(parent)
+        self.combined_path = combined_path
+        self.combined_sheet = combined_sheet
+        self.pallet_path = pallet_path
+        self.pallet_sheet = pallet_sheet
+        self.out_path = out_path
+
+    def run(self):
+        try:
+            ok, message = run_n20_generator(
+                self.combined_path, self.combined_sheet, self.pallet_path,
+                self.pallet_sheet, self.out_path)
+        except Exception:
+            ok, message = False, traceback.format_exc()
+        self.finished_with.emit({"ok": ok, "message": message,
+                                 "out_path": self.out_path})
+
+
+class N20Page(QWidget):
+    """N20 功能页: 线束计算表(Combined POS) + 装箱明细(Sheet1 (2)) -> 唛头。
+
+    两个输入文件各自带一个 sheet 列表,列表里点中的那一行就是该文件要用的 sheet;
+    选文件时会自动选中约定的 sheet 名(Combined POS / Sheet1 (2)),换了文件也能手动改。
+    """
+
+    status_changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.combined_path = None
+        self.combined_sheet = None
+        self.pallet_path = None
+        self.pallet_sheet = None
+        self.out_path = None
+        self.auto_out_path = None      # 最近一次自动填的默认输出路径
+        self.worker = None
+        self._build_ui()
+
+    def is_busy(self):
+        return self.worker is not None and self.worker.isRunning()
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(8)
+
+        header = QLabel(N20_FEATURE_NAME, self)
+        header_font = QFont()
+        header_font.setPointSize(15)
+        header_font.setBold(True)
+        header.setFont(header_font)
+        outer.addWidget(header)
+
+        mid = QHBoxLayout()
+        mid.setSpacing(10)
+        outer.addLayout(mid, 1)
+
+        # 两个输入文件各占一列: 文件 + sheet 列表
+        self.btn_combined = QPushButton("选择 Excel 文件…", self)
+        self.combined_label = QLabel("(未选择文件)", self)
+        self.combined_sheet_label = QLabel("已选 sheet: (未选择)", self)
+        self.combined_list = QListWidget(self)
+        mid.addWidget(self._build_input_box(
+            "① 线束计算表(Combined POS)", self.btn_combined, self.combined_label,
+            self.combined_list, self.combined_sheet_label), 1)
+
+        self.btn_pallet = QPushButton("选择 Excel 文件…", self)
+        self.pallet_label = QLabel("(未选择文件)", self)
+        self.pallet_sheet_label = QLabel("已选 sheet: (未选择)", self)
+        self.pallet_list = QListWidget(self)
+        mid.addWidget(self._build_input_box(
+            "② 装箱明细(Sheet1 (2))", self.btn_pallet, self.pallet_label,
+            self.pallet_list, self.pallet_sheet_label), 1)
+
+        self.btn_combined.clicked.connect(self.choose_combined_file)
+        self.btn_pallet.clicked.connect(self.choose_pallet_file)
+        self.combined_list.itemSelectionChanged.connect(
+            lambda: self._on_sheet_picked("combined"))
+        self.pallet_list.itemSelectionChanged.connect(
+            lambda: self._on_sheet_picked("pallet"))
+
+        out_box = QGroupBox("输出唛头文件", self)
+        out_row = QHBoxLayout(out_box)
+        self.btn_out = QPushButton("选择输出文件…", out_box)
+        self.btn_out.clicked.connect(self.choose_out_file)
+        out_row.addWidget(self.btn_out)
+        self.out_label = QLabel("(未选择)", out_box)
+        self.out_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        out_row.addWidget(self.out_label, 1)
+        outer.addWidget(out_box)
+
+        self.btn_run = QPushButton("生成 N20 唛头(一个托盘一个 sheet)", self)
+        self.btn_run.clicked.connect(self.on_generate)
+        outer.addWidget(self.btn_run)
+
+        self.log_text = QPlainTextEdit(self)
+        self.log_text.setReadOnly(True)
+        log_font = QFontDatabase.systemFont(
+            QFontDatabase.SystemFont.FixedFont)
+        log_font.setPointSize(12)
+        self.log_text.setFont(log_font)
+        self.log_text.setMinimumHeight(140)
+        outer.addWidget(self.log_text, 1)
+
+    def _build_input_box(self, title, btn, file_label, sheet_list, sheet_label):
+        """一个输入文件的方块: 选文件按钮 + 文件路径 + sheet 列表 + 当前 sheet。"""
+        box = QGroupBox(title, self)
+        layout = QVBoxLayout(box)
+        row = QHBoxLayout()
+        row.addWidget(btn)
+        file_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(file_label, 1)
+        layout.addLayout(row)
+        layout.addWidget(QLabel("Sheet 列表(点选一项即用它):", box))
+        sheet_list.setSelectionMode(
+            QListWidget.SelectionMode.SingleSelection)
+        layout.addWidget(sheet_list, 1)
+        sheet_label.setStyleSheet("color: #0055aa;")
+        sheet_label.setWordWrap(True)
+        layout.addWidget(sheet_label)
+        return box
+
+    # ------------------------------------------------------------- actions
+    def _log(self, text):
+        self.log_text.appendPlainText(text.rstrip())
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _refresh_labels(self):
+        self.combined_sheet_label.setText(
+            "已选 sheet: %s" % (self.combined_sheet or "(未选择)"))
+        self.pallet_sheet_label.setText(
+            "已选 sheet: %s" % (self.pallet_sheet or "(未选择)"))
+        self.out_label.setText(self.out_path or "(未选择)")
+
+    def _set_busy(self, busy):
+        for widget in (self.btn_combined, self.btn_pallet, self.btn_out,
+                       self.btn_run, self.combined_list, self.pallet_list):
+            widget.setEnabled(not busy)
+        self.status_changed.emit("生成中…" if busy else "就绪")
+
+    def _pick_excel(self, title):
+        path, _ = QFileDialog.getOpenFileName(
+            self, title, "",
+            "Excel 文件 (*.xlsx *.xlsm);;所有文件 (*)")
+        return path
+
+    def _read_sheet_names(self, path):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            return list(wb.sheetnames)
+        finally:
+            wb.close()
+
+    def _fill_sheet_list(self, sheet_list, names, wanted):
+        """填 sheet 列表,并默认选中约定名字的那个 sheet。"""
+        sheet_list.clear()
+        for name in names:
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            sheet_list.addItem(item)
+        index = names.index(wanted) if wanted in names else -1
+        if index >= 0:
+            sheet_list.setCurrentRow(index)
+
+    def _on_sheet_picked(self, which):
+        item = (self.combined_list if which == "combined"
+                else self.pallet_list).currentItem()
+        name = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if which == "combined":
+            self.combined_sheet = name
+        else:
+            self.pallet_sheet = name
+        self._refresh_labels()
+
+    def choose_combined_file(self):
+        if self.is_busy():
+            return
+        path = self._pick_excel("选择线束计算表 Excel 文件")
+        if not path:
+            return
+        try:
+            names = self._read_sheet_names(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法打开文件", "%s\n\n%s" % (path, exc))
+            return
+        self.combined_path = path
+        self.combined_label.setText(path)
+        self._fill_sheet_list(self.combined_list, names, N20_COMBINED_SHEET)
+        self._on_sheet_picked("combined")
+        self._log("线束计算表: %s" % path)
+        self._log("  sheet(%d): %s" % (len(names), ", ".join(names)))
+
+    def choose_pallet_file(self):
+        if self.is_busy():
+            return
+        path = self._pick_excel("选择装箱明细 Excel 文件")
+        if not path:
+            return
+        try:
+            names = self._read_sheet_names(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "无法打开文件", "%s\n\n%s" % (path, exc))
+            return
+        self.pallet_path = path
+        self.pallet_label.setText(path)
+        self._fill_sheet_list(self.pallet_list, names, N20_PALLET_SHEET)
+        self._on_sheet_picked("pallet")
+        # 输出默认落在装箱明细同目录,换文件时跟着更新
+        if self.out_path is None or self.out_path == self.auto_out_path:
+            self.auto_out_path = n20_default_out_path(path)
+            self.out_path = self.auto_out_path
+        self._refresh_labels()
+        self._log("装箱明细: %s" % path)
+        self._log("  sheet(%d): %s" % (len(names), ", ".join(names)))
+
+    def choose_out_file(self):
+        if self.is_busy():
+            return
+        default = self.out_path or (
+            n20_default_out_path(self.pallet_path) if self.pallet_path
+            else "唛头.xlsx")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "选择输出唛头文件", default, "Excel 文件 (*.xlsx)")
+        if not path:
+            return
+        self.out_path = path
+        self._refresh_labels()
+        self._log("输出唛头文件: %s" % path)
+
+    def on_generate(self):
+        if self.is_busy():
+            return
+        if not self.combined_path:
+            QMessageBox.warning(self, "提示", "请先选择线束计算表 Excel 文件")
+            return
+        if not self.pallet_path:
+            QMessageBox.warning(self, "提示", "请先选择装箱明细 Excel 文件")
+            return
+        if not self.combined_sheet or not self.pallet_sheet:
+            QMessageBox.warning(self, "提示", "请分别指定两个文件要用的 sheet")
+            return
+        if not self.out_path:
+            QMessageBox.warning(self, "提示", "请先选择输出唛头文件")
+            return
+        out_real = os.path.realpath(self.out_path)
+        for label, path in (("线束计算表", self.combined_path),
+                            ("装箱明细", self.pallet_path)):
+            if out_real == os.path.realpath(path):
+                QMessageBox.warning(self, "提示",
+                                    "输出文件不能覆盖%s输入的 Excel" % label)
+                return
+        too_long = windows_path_limit_hit(
+            os.path.dirname(self.out_path), [os.path.basename(self.out_path)])
+        if too_long:
+            QMessageBox.warning(
+                self, "路径过长",
+                "Windows 下完整路径超过 260 个字符就无法保存文件:\n\n%s\n\n"
+                "当前 %d 个字符。请换一个层级更浅的输出目录后重试。"
+                % (too_long, len(too_long)))
+            return
+
+        self._set_busy(True)
+        self._log("=" * 60)
+        self._log("线束计算表: %s [%s]" % (self.combined_path, self.combined_sheet))
+        self._log("装箱明细: %s [%s]" % (self.pallet_path, self.pallet_sheet))
+        self._log("输出唛头: %s" % self.out_path)
+        self.worker = N20Worker(self.combined_path, self.combined_sheet,
+                                self.pallet_path, self.pallet_sheet,
+                                self.out_path, self)
+        self.worker.finished_with.connect(self._on_done)
+        self.worker.start()
+
+    def _on_done(self, result):
+        self._set_busy(False)
+        self._log(result["message"].rstrip())
+        if result["ok"]:
+            self._log("输出: %s" % result["out_path"])
+            QMessageBox.information(self, "完成",
+                                    "已生成:\n%s" % result["out_path"])
+        else:
+            failed = result["message"].strip() or "生成失败"
+            lines = failed.splitlines()
+            if len(lines) > 20:           # 日志里有整票托盘清单,弹窗只显示开头
+                failed = "\n".join(lines[:20] + ["…(完整信息见下方日志)"])
+            QMessageBox.critical(self, "生成失败", failed)
+
+
 class MainWindow(QMainWindow):
     """主窗口「小小工具」。
 
@@ -935,6 +1285,8 @@ class MainWindow(QMainWindow):
         self.mark_page.status_changed.connect(self._on_status)
         self.asn_page = AsnPage(self)
         self.asn_page.status_changed.connect(self._on_status)
+        self.n20_page = N20Page(self)
+        self.n20_page.status_changed.connect(self._on_status)
 
         self.stack = QStackedWidget(self)
         self.nav = QListWidget(self)
@@ -943,6 +1295,7 @@ class MainWindow(QMainWindow):
         self._add_feature("首页", self._build_home())
         self._add_feature(MARKS_FEATURE_NAME, self.mark_page)
         self._add_feature(ASN_FEATURE_NAME, self.asn_page)
+        self._add_feature(N20_FEATURE_NAME, self.n20_page)
         self.nav.setCurrentRow(0)
 
     # ------------------------------------------------------------------ UI
@@ -1010,8 +1363,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(hint)
 
         layout.addSpacing(20)
-        features = QLabel("已安装功能: %s(生成南北 / 东西唛头)、%s(生成 ASN_Template)"
-                          % (MARKS_FEATURE_NAME, ASN_FEATURE_NAME), page)
+        features = QLabel("已安装功能: %s(生成南北 / 东西唛头)、%s(生成 ASN_Template)、"
+                          "%s(两份 Excel 生成 N20 唛头)"
+                          % (MARKS_FEATURE_NAME, ASN_FEATURE_NAME,
+                             N20_FEATURE_NAME), page)
         features.setAlignment(Qt.AlignmentFlag.AlignCenter)
         features.setStyleSheet("color: #888888;")
         layout.addWidget(features)
@@ -1039,7 +1394,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(text)
 
     def closeEvent(self, event):
-        if self.mark_page.is_busy() or self.asn_page.is_busy():
+        if (self.mark_page.is_busy() or self.asn_page.is_busy()
+                or self.n20_page.is_busy()):
             QMessageBox.warning(self, "提示", "正在生成,请等待完成后再关闭")
             event.ignore()
             return

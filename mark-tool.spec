@@ -34,6 +34,7 @@ GENERATOR_SCRIPTS = [
     "generate_marks_南北-0906.py",
     "generate_marks_东西-0906.py",
     "generate_asn_0904.py",
+    "generate_n20.py",
 ]
 
 # 生成脚本自己的依赖,同样因为动态加载不会被自动发现,需要显式声明。
